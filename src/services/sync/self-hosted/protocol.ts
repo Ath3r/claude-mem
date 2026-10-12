@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url, stableDocumentId, buildContentOperation, canonicalDecimalToSafeInteger } from '../CanonicalContent.js';
 
 export const PROTOCOL = 1;
@@ -73,10 +74,16 @@ export function validateRevision(input: unknown): Revision {
   return value;
 }
 export function parsePacket(input: unknown): Packet {
-  if (Buffer.byteLength(JSON.stringify(input)) > MAX_PACKET_BYTES) throw new Error('packet exceeds size limit');
-  const packet = packetSchema.parse(input);
-  for (const change of packet.changes) validateRevision(change.revision);
-  return packet;
+  try {
+    if (Buffer.byteLength(JSON.stringify(input)) > MAX_PACKET_BYTES) throw new Error('packet exceeds size limit');
+    const packet = packetSchema.parse(input);
+    for (const change of packet.changes) validateRevision(change.revision);
+    return packet;
+  } catch (error) {
+    // Validation errors can contain remote memory values; log no input or error details.
+    logger.debug('SYNC_APPLY', 'Private sync packet rejected');
+    throw error;
+  }
 }
 export const JSON_FIELDS = new Set(['facts', 'concepts', 'files_read', 'files_modified', 'files_edited', 'metadata', 'fields']);
 export const DECIMAL_FIELDS = new Set(['prompt_number', 'discovery_tokens', 'created_at_epoch']);

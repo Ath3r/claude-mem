@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'bun:test';
+import { describe, it, expect, afterEach, spyOn } from 'bun:test';
 import express from 'express';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +9,9 @@ import { SessionSearch } from '../../../src/services/sqlite/SessionSearch.js';
 import { SelfHostedSync } from '../../../src/services/sync/self-hosted/SelfHostedSync.js';
 import { SelfHostedSyncRoutes } from '../../../src/services/worker/http/routes/SelfHostedSyncRoutes.js';
 import type { DatabaseManager } from '../../../src/services/worker/DatabaseManager.js';
-import { sshRequest, loopbackWorker } from '../../../src/services/sync/self-hosted/transport.js';
+import { sshRequest, loopbackWorker, workerRequest } from '../../../src/services/sync/self-hosted/transport.js';
+import { parsePacket } from '../../../src/services/sync/self-hosted/protocol.js';
+import { logger } from '../../../src/utils/logger.js';
 
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0).reverse()) fn(); });
@@ -73,6 +75,24 @@ describe('self-hosted worker routes and manual CLI', () => {
     expect(() => loopbackWorker('https://public.example')).toThrow(); expect(() => loopbackWorker('http://localhost:37777/path')).toThrow();
     expect(() => sshRequest({ target: 'host; touch /tmp/unsafe', port: 37778, token: 'x'.repeat(43) }, 'status')).toThrow('unsafe SSH');
     expect(() => sshRequest({ target: '-oProxyCommand=evil', port: 37778, token: 'x'.repeat(43) }, 'status')).toThrow();
+  });
+  it('logs validation and access failures without remote memory, credentials or headers', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cmem-sync-log-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const a = await worker(dir, 'a');
+    const messages: unknown[][] = [];
+    const debug = spyOn(logger, 'debug').mockImplementation((...args) => { messages.push(args); });
+    const warn = spyOn(logger, 'warn').mockImplementation((...args) => { messages.push(args); });
+    cleanup.push(() => { debug.mockRestore(); warn.mockRestore(); });
+    const secret = 'private-memory-and-header-value', token = 's'.repeat(43);
+    expect(() => parsePacket({ protocol: secret, changes: [{ payload: secret }] })).toThrow();
+    expect((await fetch(`${a.url}/api/self-hosted-sync/status`, { headers: { origin: `https://${secret}.example` } })).status).toBe(403);
+    await expect(workerRequest({ worker: a.url, token }, 'status')).rejects.toThrow('HTTP 401');
+    expect(messages).toContainEqual(['SYNC_APPLY', 'Private sync packet rejected']);
+    expect(messages).toContainEqual(['SECURITY', 'Private sync access rejected: loopback CLI access required']);
+    expect(messages).toContainEqual(['SECURITY', 'Private sync authentication rejected']);
+    expect(messages).toContainEqual(['SYNC_APPLY', 'Private sync worker request rejected', { route: 'status', status: 401 }]);
+    expect(JSON.stringify(messages)).not.toContain(secret);
+    expect(JSON.stringify(messages)).not.toContain(token);
   });
   it('baseline and reconcile CLI read explicit disposable stores without enabling or migrating them', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cmem-baseline-cli-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));

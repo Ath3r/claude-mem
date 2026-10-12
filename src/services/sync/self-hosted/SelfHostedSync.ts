@@ -4,6 +4,7 @@
  */
 import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import { randomUUID, randomBytes } from 'crypto';
+import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url } from '../CanonicalContent.js';
 import { SyncApply, type ChromaSyncLike, type SyncOp } from '../SyncApply.js';
 import { emitContextInvalidation } from '../../../shared/context-invalidation.js';
@@ -407,7 +408,10 @@ export class SelfHostedSync {
     this.flushing = (async () => {
       for (const job of this.db.query('SELECT * FROM self_sync_jobs ORDER BY seq').all() as Array<{ id: string; row_id: number; op: string }>) {
         try { await this.nativeApplier().forwardSelfHostedRow(JSON.parse(job.op), job.row_id); this.db.query('DELETE FROM self_sync_jobs WHERE id=?').run(job.id); }
-        catch { break; } // durable retry on next exchange, startup or manual sync
+        catch {
+          logger.warn('SYNC_APPLY', 'Private sync indexing deferred; durable job retained');
+          break; // durable retry on next exchange, startup or manual sync
+        }
       }
     })().finally(() => { this.flushing = null; });
     return this.flushing;

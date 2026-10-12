@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { timingSafeEqual } from 'crypto';
 import { z } from 'zod';
+import { logger } from '../../../../utils/logger.js';
 import type { DatabaseManager } from '../../DatabaseManager.js';
 import { getWorkerHost } from '../../../../shared/worker-utils.js';
 import type { Baseline } from '../../../sync/self-hosted/SelfHostedSync.js';
@@ -16,12 +17,17 @@ export class SelfHostedSyncRoutes {
       const host = (this.options.host ?? getWorkerHost)();
       const remote = req.socket.remoteAddress;
       if (!['127.0.0.1', '::1', 'localhost'].includes(host) || !['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote ?? '') || req.headers.origin || req.headers['sec-fetch-site']) {
+        logger.warn('SECURITY', 'Private sync access rejected: loopback CLI access required');
         res.status(403).json({ error: 'self-hosted sync requires a loopback worker and non-browser SSH/CLI access' }); return;
       }
       if (req.path === '/setup' && (this.options.allowSetup ?? process.env.CLAUDE_MEM_SELF_HOSTED_SYNC_ALLOW_SETUP === '1')) { next(); return; }
       const token = this.manager.getSelfHostedSync().token();
       const presented = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.get('authorization') ?? '')?.[1] ?? '';
-      if (!token || Buffer.byteLength(presented) !== Buffer.byteLength(token) || !timingSafeEqual(Buffer.from(presented), Buffer.from(token))) { res.status(401).json({ error: 'self-hosted sync token required' }); return; }
+      if (!token || Buffer.byteLength(presented) !== Buffer.byteLength(token) || !timingSafeEqual(Buffer.from(presented), Buffer.from(token))) {
+        logger.debug('SECURITY', 'Private sync authentication rejected');
+        res.status(401).json({ error: 'self-hosted sync token required' });
+        return;
+      }
       next();
     });
     const handle = (handler: (req: Request, res: Response) => void | Promise<void>) => (req: Request, res: Response, next: NextFunction) => { Promise.resolve().then(() => handler(req, res)).catch(next); };

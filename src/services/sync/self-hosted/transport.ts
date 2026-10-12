@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { logger } from '../../../utils/logger.js';
 import { MAX_PACKET_BYTES } from './protocol.js';
 
 export interface SyncConnection { worker: string; token: string }
@@ -21,7 +22,10 @@ export async function workerRequest(connection: SyncConnection, route: string, b
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(30_000),
   });
   const text = await boundedResponse(response);
-  if (!response.ok) throw new Error(`worker ${route} rejected request (HTTP ${response.status})`);
+  if (!response.ok) {
+    logger.warn('SYNC_APPLY', 'Private sync worker request rejected', { route, status: response.status });
+    throw new Error(`worker ${route} rejected request (HTTP ${response.status})`);
+  }
   return JSON.parse(text);
 }
 async function boundedResponse(response: Response): Promise<string> {
@@ -47,7 +51,21 @@ export function sshRequest(connection: SshConnection, route: string, body?: unkn
     const child = spawn('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', connection.target, command], { stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0, settled = false;
     const timeout = setTimeout(() => { child.kill('SIGTERM'); finish(new Error('SSH request timed out')); }, 45_000);
-    function finish(error?: Error) { if (settled) return; settled = true; clearTimeout(timeout); if (error) reject(error); else { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { reject(new Error('invalid SSH receiver response')); } } }
+    function finish(error?: Error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) {
+        logger.warn('SYNC_APPLY', 'Private sync SSH exchange failed; retry remains available');
+        reject(error);
+      } else {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch {
+          logger.warn('SYNC_APPLY', 'Private sync SSH response rejected');
+          reject(new Error('invalid SSH receiver response'));
+        }
+      }
+    }
     child.on('error', error => finish(error)); child.stdin.on('error', () => {});
     child.stderr.on('data', () => {}); // never print remote memory, tokens, or config
     child.stdout.on('data', (chunk: Buffer) => { size += chunk.length; if (size > MAX_PACKET_BYTES) { child.kill('SIGTERM'); finish(new Error('SSH response exceeds size limit')); } else chunks.push(chunk); });
