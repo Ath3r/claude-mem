@@ -65,5 +65,14 @@ export function getWorkStateEntries(db: Database, projects: string[], listName?:
     WHERE project COLLATE NOCASE IN (${placeholders})${listFilter}
     ORDER BY id
   `).all(...projects, ...(listName === undefined ? [] : [listName])) as Array<Omit<WorkStateEntry, 'fields'> & { fields: string }>;
-  return rows.map(row => ({ ...row, fields: JSON.parse(row.fields) as WorkStateFields }));
+  const entries = rows.map(row => ({ ...row, fields: JSON.parse(row.fields) as WorkStateFields }));
+  // The fork's opt-in lane projects causal work events. Preserve unsynced local
+  // appends after that projection so offline writes remain immediately visible.
+  if (!db.query("SELECT name FROM sqlite_master WHERE name='self_sync_config'").get()
+      || !(db.query('SELECT enabled FROM self_sync_config WHERE singleton=1').get() as { enabled: number } | undefined)?.enabled) return entries;
+  const captured = new Set((db.query("SELECT row_id FROM self_sync_map WHERE kind='work' AND row_id IS NOT NULL").all() as Array<{ row_id: number }>).map(row => row.row_id));
+  const projected = db.query(`SELECT project,list_name,fields,created_at_epoch FROM self_sync_work_projection
+    WHERE project COLLATE NOCASE IN (${placeholders})${listFilter} ORDER BY scope`)
+    .all(...projects, ...(listName === undefined ? [] : [listName])) as Array<Omit<WorkStateEntry, 'id' | 'fields'> & { fields: string }>;
+  return [...projected.map((row, index) => ({ ...row, id: index + 1, fields: JSON.parse(row.fields) as WorkStateFields })), ...entries.filter(entry => !captured.has(entry.id))];
 }

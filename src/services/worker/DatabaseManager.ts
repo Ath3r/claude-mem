@@ -5,6 +5,7 @@ import { SessionSearch } from '../sqlite/SessionSearch.js';
 import { openConfiguredSqliteDatabase } from '../sqlite/connection.js';
 import { ChromaSync } from '../sync/ChromaSync.js';
 import { CloudSync } from '../sync/CloudSync.js';
+import { SelfHostedSync } from '../sync/self-hosted/SelfHostedSync.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, DB_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
@@ -19,6 +20,7 @@ export class DatabaseManager {
   private sessionSearch: SessionSearch | null = null;
   private chromaSync: ChromaSync | null = null;
   private cloudSync: CloudSync | null = null;
+  private selfHostedSync: SelfHostedSync | null = null;
 
   async initialize(): Promise<void> {
     this.db = openConfiguredSqliteDatabase(DB_PATH);
@@ -48,6 +50,12 @@ export class DatabaseManager {
       logger.info('DB', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, using SQLite-only search');
     }
 
+    this.selfHostedSync = new SelfHostedSync(this.db, { chromaSync: this.chromaSync });
+    if (this.selfHostedSync.configured() && cloudSyncConfigured) {
+      throw new Error('Self-hosted and Pro sync cannot own the same content identities simultaneously');
+    }
+    if (this.selfHostedSync.configured()) void this.selfHostedSync.flushIndexJobs().catch(() => {});
+
     // Inactive installs get null so the write-site `getCloudSync()?.notify()`
     // nudges are free no-ops.
     if (cloudSyncConfigured) {
@@ -65,6 +73,7 @@ export class DatabaseManager {
   }
 
   async close(): Promise<void> {
+    this.selfHostedSync = null;
     this.chromaSync = null;
 
     this.cloudSync?.stop();
@@ -100,6 +109,11 @@ export class DatabaseManager {
 
   getCloudSync(): CloudSync | null {
     return this.cloudSync;
+  }
+
+  getSelfHostedSync(): SelfHostedSync {
+    if (!this.selfHostedSync) throw new Error('Database not initialized');
+    return this.selfHostedSync;
   }
 
   getConnection(): Database {
