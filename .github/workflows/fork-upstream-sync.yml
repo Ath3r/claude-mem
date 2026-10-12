@@ -1,0 +1,33 @@
+name: Prepare upstream update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'Ath3r/claude-mem'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Test updater isolation and merge behavior
+        run: python3 -m unittest discover -s scripts/fork -p 'test_*.py' -v
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/thedotmack/claude-mem.git
+      - name: Prepare draft update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/fork/sync-upstream.py --publish --github-repo Ath3r/claude-mem
