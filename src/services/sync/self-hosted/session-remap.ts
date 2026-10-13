@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url } from '../CanonicalContent.js';
 import { PROTOCOL, entityId, portablePayload, revision, type Kind } from './protocol.js';
 import type { Baseline } from './SelfHostedSync.js';
@@ -12,6 +13,11 @@ const schema = z.object({
   manifestHash: digest, sessionLocal: local,
   oldMemorySessionId: reference, newMemorySessionId: reference,
   reason: z.string().min(1).max(512),
+  parentCompletion: z.object({
+    mode: z.literal('completion-pair-after-remap-v1'),
+    referenceOnlyHash: digest,
+    reason: z.string().min(1).max(512),
+  }).strict().optional(),
   rows: z.array(z.object({
     kind: z.enum(['session', 'observation', 'summary', 'prompt']), local,
     expectedHash: digest, currentHash: digest,
@@ -50,7 +56,17 @@ export function validateSessionRemapPlan(input: unknown, baseline: Baseline, row
     if (hash(payload) !== entry.currentHash || entry.currentHash === entry.expectedHash) throw new Error('session remap current hash mismatch');
     revision({ kind: entry.kind, entity: entityId(entry.kind, plan.namespace, entry.local), owner: plan.namespace, local: entry.local, actor: plan.namespace, parents: [], causes: [], payload: entry.baselinePayload, deleted: false });
     revision({ kind: entry.kind, entity: entityId(entry.kind, plan.namespace, entry.local), owner: plan.namespace, local: entry.local, actor: plan.namespace, parents: [], causes: [], payload, deleted: false });
-    if (entry.baselinePayload.memory_session_id !== plan.oldMemorySessionId || payload.memory_session_id !== plan.newMemorySessionId || canonicalJson({ ...entry.baselinePayload, memory_session_id: plan.newMemorySessionId }) !== canonicalJson(payload)) throw new Error('session remap unreviewed field/reference change');
+    if (entry.baselinePayload.memory_session_id !== plan.oldMemorySessionId || payload.memory_session_id !== plan.newMemorySessionId) throw new Error('session remap unreviewed field/reference change');
+    const referenceOnly: Record<string, unknown> = { ...entry.baselinePayload, memory_session_id: plan.newMemorySessionId };
+    if (plan.parentCompletion && entry.kind === 'session' && entry.local === plan.sessionLocal) {
+      // Validation witness only: it establishes the exact permitted difference,
+      // not historical ordering. Return the original baseline for B -> C capture.
+      if (hash(referenceOnly) !== plan.parentCompletion.referenceOnlyHash) throw new Error('session remap reference-only hash mismatch');
+      const changed = Object.keys(payload).filter(field => canonicalJson(payload[field]) !== canonicalJson(referenceOnly[field])).sort();
+      if (canonicalJson(changed) !== canonicalJson(['completed_at', 'completed_at_epoch'])) throw new Error('session remap unreviewed completion field change');
+      const epoch = payload.completed_at_epoch;
+      if (typeof epoch !== 'number' || typeof payload.completed_at !== 'string' || Date.parse(payload.completed_at) !== epoch || (entry.baselinePayload.completed_at_epoch !== null && epoch <= Number(entry.baselinePayload.completed_at_epoch))) throw new Error('session remap completion must advance');
+    } else if (canonicalJson(referenceOnly) !== canonicalJson(payload)) throw new Error('session remap unreviewed field/reference change');
     reviewed.set(k, entry);
   }
   const session = reviewed.get(key('session', plan.sessionLocal));
@@ -84,5 +100,6 @@ export function validateSessionRemapPlan(input: unknown, baseline: Baseline, row
     }
   }
   if (closure.size !== approved.size || [...closure].some(k => !approved.has(k))) throw new Error('session remap incomplete or conflicting graph');
+  logger.debug('SYNC_APPLY', 'Private session remap plan validated', { sharedRows: reviewed.size, independentRows: plan.independentRows.length });
   return reviewed;
 }
