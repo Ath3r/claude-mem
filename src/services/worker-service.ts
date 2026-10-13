@@ -153,6 +153,7 @@ import { DedupRoutes } from './worker/http/routes/DedupRoutes.js';
 import { CorpusRoutes } from './worker/http/routes/CorpusRoutes.js';
 import { ChromaRoutes } from './worker/http/routes/ChromaRoutes.js';
 import { CloudSyncRoutes } from './worker/http/routes/CloudSyncRoutes.js';
+import { SelfHostedSyncRoutes } from './worker/http/routes/SelfHostedSyncRoutes.js';
 
 import { CorpusStore } from './worker/knowledge/CorpusStore.js';
 import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
@@ -555,6 +556,7 @@ export class WorkerService implements WorkerRef {
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new AdvisorRoutes(this.dbManager));
     this.server.registerRoutes(new WorkStateRoutes(this.dbManager));
+    this.server.registerRoutes(new SelfHostedSyncRoutes(this.dbManager));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
     this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));

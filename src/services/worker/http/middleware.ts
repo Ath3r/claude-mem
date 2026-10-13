@@ -11,12 +11,18 @@ import {
   parseHostWithoutPort,
 } from '../../../server/middleware/request-auth-helpers.js';
 import { logger } from '../../../utils/logger.js';
+import { LARGE_SYNC_BODY_LIMITS } from '../../sync/self-hosted/protocol.js';
 import { redactForLog } from '../../../utils/redaction.js';
 
 export function createMiddleware(): RequestHandler[] {
   const middlewares: RequestHandler[] = [];
 
-  middlewares.push(express.json({ limit: '5mb' }));
+  const defaultJson = express.json({ limit: '5mb' });
+  // Large sync bodies are parsed by their router, after its loopback/auth gate.
+  middlewares.push((req, res, next) => {
+    if (req.method === 'POST' && Object.hasOwn(LARGE_SYNC_BODY_LIMITS, req.path)) return next();
+    return defaultJson(req, res, next);
+  });
 
   middlewares.push((req: Request, res: Response, next: NextFunction) => {
     const staticExtensions = ['.html', '.js', '.css', '.svg', '.png', '.jpg', '.jpeg', '.webp', '.woff', '.woff2', '.ttf', '.eot'];
