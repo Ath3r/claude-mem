@@ -2,9 +2,17 @@ import { z } from 'zod';
 import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url, stableDocumentId, buildContentOperation, canonicalDecimalToSafeInteger } from '../CanonicalContent.js';
 
-export const PROTOCOL = 1;
+export const PROTOCOL = 2;
 export const PAGE_SIZE = 24;
 export const MAX_PACKET_BYTES = 8 * 1024 * 1024;
+export const MAX_BASELINE_BYTES = 32 * 1024 * 1024;
+export const MAX_ACCEPT_BYTES = 2 * MAX_PACKET_BYTES + 1024;
+export const LARGE_SYNC_BODY_LIMITS: Readonly<Record<string, number>> = {
+  '/api/self-hosted-sync/setup': MAX_BASELINE_BYTES + 65536,
+  '/api/self-hosted-sync/reconcile': MAX_BASELINE_BYTES,
+  '/api/self-hosted-sync/exchange': MAX_PACKET_BYTES,
+  '/api/self-hosted-sync/accept': MAX_ACCEPT_BYTES,
+};
 export const TABLES = { session: 'sdk_sessions', observation: 'observations', summary: 'session_summaries', prompt: 'user_prompts', work: 'work_state_entries' } as const;
 export type Kind = keyof typeof TABLES;
 const digest = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
@@ -39,7 +47,7 @@ const sessionSchema = z.object({
   completed_at: z.string().datetime().nullable(), completed_at_epoch: sequence.nullable(),
   observed_model: z.string().nullable(), observed_billing: z.string().nullable(),
 }).strict();
-const workSchema = z.object({ project: z.string().min(1).max(4096), list_name: z.string().min(1).max(256), fields: z.record(z.string().min(1).max(256), primitive).refine(v => Object.keys(v).length <= 256), created_at: z.string().datetime(), created_at_epoch: sequence }).strict();
+const workSchema = z.object({ scope_project: z.string().min(1).max(4096), project: z.string().min(1).max(4096), list_name: z.string().min(1).max(256), fields: z.record(z.string().min(1).max(256), primitive).refine(v => Object.keys(v).length <= 256), created_at: z.string().datetime(), created_at_epoch: sequence }).strict();
 
 export function entityId(kind: Kind, owner: string, local: string): string {
   if (kind === 'session' || kind === 'work') return `${kind}:${sha256Base64Url(canonicalJson(['cmem-doc-id-v1', 'device', kind, owner, local]))}`;
@@ -92,8 +100,10 @@ export function nativePayload(payload: Record<string, unknown>): Record<string, 
 }
 export function portablePayload(kind: Kind, row: Record<string, unknown>): Record<string, unknown> {
   const fields = kind === 'session' ? SESSION_FIELDS : kind === 'work' ? ['project', 'list_name', 'fields', 'created_at', 'created_at_epoch'] : CONTENT_FIELDS[kind];
-  return Object.fromEntries(fields.map(k => {
+  const payload = Object.fromEntries(fields.map(k => {
     const v = row[k] ?? null;
     return [k, v === null ? null : JSON_FIELDS.has(k) ? typeof v === 'string' ? JSON.parse(v) : v : kind !== 'session' && kind !== 'work' && DECIMAL_FIELDS.has(k) ? String(v) : v];
   }));
+  if (kind === 'work' && typeof row.scope_project === 'string') payload.scope_project = row.scope_project;
+  return payload;
 }

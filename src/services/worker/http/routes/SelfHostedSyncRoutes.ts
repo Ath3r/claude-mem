@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { logger } from '../../../../utils/logger.js';
 import type { DatabaseManager } from '../../DatabaseManager.js';
 import { getWorkerHost } from '../../../../shared/worker-utils.js';
+import { LARGE_SYNC_BODY_LIMITS } from '../../../sync/self-hosted/protocol.js';
 import type { Baseline } from '../../../sync/self-hosted/SelfHostedSync.js';
 
 /** SSH accesses loopback only. Never accept browser origins, forwarded-IP trust,
@@ -30,14 +31,22 @@ export class SelfHostedSyncRoutes {
       }
       next();
     });
-    const handle = (handler: (req: Request, res: Response) => void | Promise<void>) => (req: Request, res: Response, next: NextFunction) => { Promise.resolve().then(() => handler(req, res)).catch(next); };
+    for (const [path, limit] of Object.entries(LARGE_SYNC_BODY_LIMITS)) {
+      router.post(path.slice('/api/self-hosted-sync'.length), express.json({ limit, inflate: false }));
+    }
+    // Parser/schema errors may contain private memory. Never pass them to the
+    // worker's default error handler, which can log/return the raw exception.
+    router.use((error: { status?: number }, _req: Request, res: Response, _next: NextFunction) => {
+      res.status(error.status === 413 ? 413 : error.status === 415 ? 415 : 400).json({ error: 'invalid private sync request' });
+    });
+    const handle = (handler: (req: Request, res: Response) => void | Promise<void>) => (req: Request, res: Response, next: NextFunction) => { Promise.resolve().then(() => handler(req, res)).catch(() => { res.status(400).json({ error: 'private sync request rejected' }); }); };
     router.get('/status', handle((_req, res) => { res.json(this.manager.getSelfHostedSync().status()); }));
     router.get('/baseline', handle((_req, res) => { res.json(this.manager.getSelfHostedSync().baseline()); }));
     router.post('/reconcile', handle((req, res) => { res.json(this.manager.getSelfHostedSync().reconcile(req.body as Baseline)); }));
     router.post('/setup', handle((req, res) => {
       if (this.manager.getCloudSync()) throw new Error('disable Pro sync before self-hosted setup');
-      const body = z.object({ independent: z.boolean().optional(), baseline: z.unknown().optional() }).strict().parse(req.body);
-      res.json(this.manager.getSelfHostedSync().setup({ independent: body.independent, baseline: body.baseline as Baseline | undefined }));
+      const body = z.object({ independent: z.boolean().optional(), baseline: z.unknown().optional(), workProjectAliases: z.array(z.array(z.string().min(1).max(4096)).min(2).max(256)).max(256).optional() }).strict().parse(req.body);
+      res.json(this.manager.getSelfHostedSync().setup({ independent: body.independent, baseline: body.baseline as Baseline | undefined, workProjectAliases: body.workProjectAliases }));
     }));
     router.post('/enabled', handle((req, res) => { const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body); if (enabled && this.manager.getCloudSync()) throw new Error('disable Pro sync before enabling the private journal'); this.manager.getSelfHostedSync().setEnabled(enabled); res.json({ enabled }); }));
     router.post('/prepare', handle((req, res) => { const { peer } = z.object({ peer: z.string().uuid().optional() }).strict().parse(req.body); res.json(this.manager.getSelfHostedSync().prepare(peer)); }));

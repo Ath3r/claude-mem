@@ -6,12 +6,12 @@ This fork can exchange local memory between independently operating devices usin
 
 ## Boundaries
 
-- Same private protocol (currently 1) and exact SQLite `schema_versions` maximum on both workers. Current source creates schema 65; an installed schema 64 worker must be deliberately upgraded first. Compare the actual stores; the package version alone is insufficient.
+- Same private protocol (currently 2) and exact SQLite `schema_versions` maximum on both workers. Current source creates schema 65; an installed schema 64 worker must be deliberately upgraded first. Compare the actual stores; the package version alone is insufficient. Protocol 2 includes canonical work scope; journals from earlier PR builds fail closed, including work projection reads, and need explicit recovery on disposable copies.
 - Native Pro sync and private sync cannot run simultaneously against one database. They would compete for content origin columns. Disable Pro before setting up this lane.
 - Worker must bind to `127.0.0.1`, `::1`, or `localhost`. Routes reject non-loopback peers, browser `Origin`/`Sec-Fetch-Site`, missing/invalid bearer tokens, and public worker binds. SSH host-key verification uses the existing OpenSSH policy; it is never disabled.
 - Only sessions, observations, summaries, prompts, and append-only work-state events sync. Tool-use payloads, pending processing queues, authentication/settings files, cwd, worker port, prompt counters, reinforcement/usage state, and embeddings stay local. Portable session fields include original session identifiers, project/platform, prompt/title, start/completion times, and observed model/billing. Remote sessions are created as completed history and cannot launch a processor.
 - Sessions/content have tombstones. Session deletion waits until referencing content is deleted and refuses to remove active sessions, pending work, tool uses, or independently created records. Those cases are explicit projection conflicts. Work-state events cannot be edited/deleted; close lists/tasks with status `done` or `dropped`.
-- No remote SQL or paths are accepted. Payloads use fixed allowlists, canonical hashes, globally unique origin identities, safe numeric bounds, at most 24 revisions/page, at most 260 KB/revision and 8 MB/packet, and at most 256 causal references. Exceeding a bound fails closed without losing local records.
+- No remote SQL or paths are accepted. Payloads use fixed allowlists, canonical hashes, globally unique origin identities, safe numeric bounds, at most 24 revisions/page, at most 260 KB/revision and 8 MiB/packet, and at most 256 causal references. Baseline manifests are capped at 32 MiB; setup allows a further 64 KiB envelope, and accept allows two packets plus 1 KiB. These routes use bounded JSON parsers after the loopback/authentication gate, reject compressed bodies, and return sanitized errors. Other worker routes retain their 5 MiB limit. Exceeding a bound fails closed without losing local records.
 
 ## Reconcile shared history before assigning device identities
 
@@ -37,6 +37,18 @@ Read the counts:
 The first implementation requires matching IDs for baseline rows. It does not guess mappings for reordered imports, changed historical rows, or partially overlapping work-event sequences. Do not bypass an ambiguous report with `--independent`. Missing baseline rows are not inferred as deletions: absence before setup has no deletion authority.
 
 For two stores with truly independent histories, use `--independent` explicitly on each; equal local SQLite IDs are safe because each device gets a different UUID.
+
+### Review checkout aliases before setup
+
+Native work-state reads can combine configured, legacy, and parent checkout project keys, but those relationships are not stored durably with historical events. Setup conservatively refuses histories where the same list/task/key appears under multiple unreviewed projects. This can also block unrelated projects with similar task names; refusal is a safety boundary, not evidence that those projects are aliases. Never merge unrelated projects to bypass it.
+
+For verified checkout aliases, create the same private JSON file on both devices. Each group lists historical keys first and the canonical key last:
+
+```json
+[["legacy-checkout", "parent-checkout", "configured-checkout"]]
+```
+
+Pass `--work-aliases /private/path/work-aliases.json` to both setup commands below. The alias plan is immutable for this first implementation. It captures shared work events in native append order under one causal scope, preserving completion even if timestamps go backward. Both devices must agree on the canonical scope; mismatched plans reject the batch without advancing checkpoints. If no verified plan resolves an activation refusal, keep sync disabled and retain the native histories for review.
 
 ## Explicit setup and connect
 
@@ -103,8 +115,12 @@ Received revisions, projections, replay identities and peer checkpoints commit i
 
 Native `CanonicalContent` validates observation/summary/prompt payloads. Native `SyncApply` handles their local row/session mapping. Base-table writes activate SQLite FTS triggers. The worker emits in-process context invalidation only after commit, and persists index jobs in SQLite before Chroma forwarding. Failed forwarding stays pending and retries on the next exchange or worker startup; native Chroma also retains its existing pending reconciliation markers. Deletion jobs remove all Chroma fragments for that SQLite record. Content conflicts remain visible through status; resolving them schedules a fresh index projection.
 
+Session updates can change joined prompt fields and cascade memory identifiers into observations and summaries. Their receiver-side fingerprints and index jobs update atomically with the session projection, so a later page does not mistake those SQL effects for new local edits. Genuine local edits are captured before applying incoming pages and remain distinct revisions. Native content application cannot implicitly create/adopt/merge session stubs or leave a portable row different from its revision; such projections remain explicit conflicts until authoritative session metadata makes the association safe.
+
 ## Validation evidence and gaps
 
 Focused tests use disposable stores only. They cover two-way exchanges across all five kinds, retries/no-op batches,70 event paging, session FK mapping, simultaneous edits and explicit resolution, offline catch-up, content/session tombstones without resurrection, preservation of independent rows, receiver/client crash rollback, shared baseline identities and VPS-native preservation, strict protocol/schema/hash/identity rejection, prototype-named fields, durable index jobs and cache invalidation. Three-device tests cover shared work-state completion, delayed events, concurrent completion/reopen and explicit causal resolution.
+
+The HTTP tests use the production middleware, including a baseline above 5 MiB, valid large 24-revision pages, a two-packet accept body, exact byte limits, authentication before parsing, and sanitized parser errors. Alias regressions cover refused activation, reviewed shared history, completion before any exchange, mismatched plans, and concurrent reopening. A 24-session page regression covers joined prompts and observation/summary cascades without receiver-authored revisions, index scheduling, and preservation of a genuine edit between pages.
 
 The CLI smoke runs two disposable worker-route HTTP servers with real CLI subprocesses and curl. A temporary SSH shim simulates remote command execution; it does **not** prove real SSH authentication, host-key handling, the production worker lifecycle, installed plugin compatibility, live Chroma, or real Mac/VPS baseline attribution. Those remain required before live activation. No existing Mac/VPS store, service, plugin installation, or schedule was changed.
