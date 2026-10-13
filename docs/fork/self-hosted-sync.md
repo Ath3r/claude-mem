@@ -1,5 +1,7 @@
 # Manual two-way sync over SSH
 
+The [combined upstream 13.37 release candidate](self-hosted-sync-release-13.37.md) records the rebuilt artifacts, disposable validation, and parent-owned rollout gates. The PR5 evidence below remains historical compatibility evidence.
+
 This fork can exchange local memory between independently operating devices using a private SQLite revision journal. It needs Bun, the fork's worker on each device, curl on the receiver, and an existing SSH key. It does not need cmem.ai Pro. Both directions run from the initiating device: the Mac pushes its journal and pulls the VPS journal in the same exchange. Either device can keep writing while SSH is unavailable. Retrying resumes from SQLite checkpoints.
 
 **This implementation does not install a timer, scheduler, service, or launch agent. Installing/building it does not enable sync.** Live activation requires a separately reviewed upgrade, backups, baseline reconciliation, and explicit setup. Do not run the old `scripts/claude-mem-sync` alongside it: that script's timestamp/title import does not share these identities.
