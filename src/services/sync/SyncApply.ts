@@ -220,6 +220,7 @@ export interface SyncOp {
  * it and Phase 3 can pass the real instance.
  */
 export interface ChromaSyncLike {
+  removeSyncedContent?(kind: 'observation' | 'summary' | 'prompt', sqliteId: number): Promise<void>;
   syncObservation(
     observationId: number,
     memorySessionId: string,
@@ -379,6 +380,38 @@ export class SyncApply {
     this.deviceId = options.deviceId;
     this.chromaSync = options.chromaSync ?? null;
     this.now = options.now ?? Date.now;
+  }
+
+  /** Private fork transport: caller owns the transaction and causal revision guard.
+   * No cloud cursor/head is changed and no side effects run before its commit.
+   */
+  applySelfHostedRow(op: SyncOp): number | null {
+    if (op.kind === 'mutation') throw new Error('self-hosted mutations use causal row revisions');
+    const table = op.kind === 'observation' ? 'observations' : op.kind === 'summary' ? 'session_summaries' : 'user_prompts';
+    const old = this.findByOrigin(table, op.origin_device, op.origin_id);
+    if (op.deleted) {
+      if (old) this.db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(old.id);
+      return old?.id ?? null;
+    }
+    const projected = { ...op, rev: incrementCanonicalDecimal(old?.sync_rev ?? '0') };
+    if (this.applyRowOp(projected, []) !== 'applied') throw new Error('content identity collided with an independently created row');
+    return this.findByOrigin(table, op.origin_device, op.origin_id)?.id ?? null;
+  }
+
+  /** Reconstructible post-commit job; durable retries are owned by self-hosted sync. */
+  async forwardSelfHostedRow(op: SyncOp, sqliteId: number): Promise<void> {
+    if (op.kind === 'mutation' || !this.chromaSync) return;
+    if (op.deleted) {
+      if (!this.chromaSync.removeSyncedContent) throw new Error('Chroma forwarder cannot remove tombstones');
+      await this.chromaSync.removeSyncedContent(op.kind, sqliteId);
+      return;
+    }
+    const jobs: ChromaJob[] = [];
+    const body = this.parseBody(op);
+    if (op.kind === 'observation') this.forwardObservation(sqliteId, op, body, jobs, true);
+    else if (op.kind === 'summary') this.forwardSummary(sqliteId, op, body, jobs, true);
+    else this.forwardPrompt(sqliteId, op, body, jobs);
+    for (const job of jobs) await job();
   }
 
   // -------------------------------------------------------------------------

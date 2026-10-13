@@ -872,6 +872,11 @@ export class ChromaSync {
     }
   }
 
+  /** Self-hosted tombstones remove every fragment of this SQLite record. */
+  async removeSyncedContent(kind: 'observation' | 'summary' | 'prompt', sqliteId: number): Promise<void> {
+    await this.removeObsoleteFragments(kind === 'summary' ? 'session_summary' : kind === 'prompt' ? 'user_prompt' : 'observation', sqliteId, []);
+  }
+
   async syncObservation(
     observationId: number,
     memorySessionId: string,
