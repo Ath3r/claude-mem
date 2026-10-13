@@ -2,13 +2,14 @@
  * Captures portable rows before every exchange: offline writes need no network or scheduler.
  * Base-table SQL and incoming checkpoints commit together; FTS triggers remain authoritative.
  */
+import { validateBootstrapPlan, type BootstrapPlan } from './bootstrap.js';
 import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import { randomUUID, randomBytes } from 'crypto';
 import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url } from '../CanonicalContent.js';
 import { SyncApply, type ChromaSyncLike, type SyncOp } from '../SyncApply.js';
 import { emitContextInvalidation } from '../../../shared/context-invalidation.js';
-import { TABLES, PAGE_SIZE, MAX_PACKET_BYTES, MAX_BASELINE_BYTES, PROTOCOL, entityId, revision, parsePacket, portablePayload, nativePayload, SESSION_FIELDS, type Kind, type Revision, type Packet } from './protocol.js';
+import { TABLES, PAGE_SIZE, MAX_PACKET_BYTES, MAX_BASELINE_BYTES, PROTOCOL, entityId, revision, parsePacket, portablePayload, nativePayload, SESSION_FIELDS, CONTENT_FIELDS, type Kind, type Revision, type Packet } from './protocol.js';
 
 export interface Baseline { protocol: typeof PROTOCOL; namespace: string; schema: number; rows: Array<{ kind: Kind; local: string; hash: string }> }
 interface Mapping { entity: string; kind: Kind; owner: string; local: string; row_id: number | null; snapshot: string }
@@ -47,6 +48,9 @@ export class SelfHostedSync {
       CREATE TABLE IF NOT EXISTS self_sync_config(singleton INTEGER PRIMARY KEY CHECK(singleton=1), device TEXT NOT NULL, epoch TEXT NOT NULL, enabled INTEGER NOT NULL, auth_token TEXT NOT NULL, protocol INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS self_sync_map(entity TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, local TEXT NOT NULL, row_id INTEGER, snapshot TEXT NOT NULL, UNIQUE(kind,row_id));
       CREATE TABLE IF NOT EXISTS self_sync_log(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS self_sync_log_kind_seq ON self_sync_log(json_extract(body,'$.kind'),seq);
+      CREATE TABLE IF NOT EXISTS self_sync_capture(singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, captured INTEGER NOT NULL);
+      INSERT OR IGNORE INTO self_sync_capture VALUES(1,0,-1);
       CREATE TABLE IF NOT EXISTS self_sync_heads(entity TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(entity,id));
       CREATE TABLE IF NOT EXISTS self_sync_peers(device TEXT PRIMARY KEY, epoch TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS self_sync_received(device TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, PRIMARY KEY(device,seq));
@@ -56,6 +60,28 @@ export class SelfHostedSync {
       CREATE TABLE IF NOT EXISTS self_sync_work_aliases(project TEXT PRIMARY KEY, canonical TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS self_sync_work_conflicts(scope TEXT NOT NULL, field TEXT NOT NULL, revisions TEXT NOT NULL, PRIMARY KEY(scope,field));
     `);
+    // SQLite triggers see writes from every connection, including offline writers.
+    // Only portable inputs dirty capture; sync/index bookkeeping does not.
+    for (const kind of KINDS) {
+      const table = TABLES[kind];
+      const columns = kind === 'session' ? SESSION_FIELDS : kind === 'work'
+        ? ['project', 'list_name', 'fields', 'created_at', 'created_at_epoch']
+        : kind === 'prompt' ? ['session_db_id', 'content_session_id', 'prompt_number', 'prompt_text', 'created_at', 'created_at_epoch'] : CONTENT_FIELDS[kind];
+      for (const event of ['INSERT', 'DELETE', `UPDATE OF ${columns.join(',')}`]) {
+        const name = event.split(' ')[0].toLowerCase();
+        this.db.exec(`CREATE TRIGGER IF NOT EXISTS self_sync_dirty_${kind}_${name} AFTER ${event} ON ${table}
+          BEGIN UPDATE self_sync_capture SET revision=revision+1 WHERE singleton=1; END;`);
+      }
+    }
+  }
+  private captureState(): { revision: number; captured: number } | undefined {
+    // Pre-compat journals retain the conservative full scan until explicitly
+    // migrated. Never install triggers or mutate an unconfigured store on read.
+    if (!this.db.query("SELECT 1 FROM sqlite_master WHERE name='self_sync_capture'").get()) return undefined;
+    return this.db.query('SELECT revision,captured FROM self_sync_capture WHERE singleton=1').get() as { revision: number; captured: number } | undefined;
+  }
+  private acknowledgeCapture(): void {
+    if (this.captureState()) this.db.query('UPDATE self_sync_capture SET captured=revision WHERE singleton=1').run();
   }
   private rows(kind: Kind): Array<Record<string, unknown> & { id: number }> {
     if (kind === 'prompt') return this.db.query(`SELECT p.*, s.memory_session_id, COALESCE(s.project,'unknown') AS project, COALESCE(s.platform_source,'claude-code') AS platform_source FROM user_prompts p LEFT JOIN sdk_sessions s ON p.session_db_id=s.id ORDER BY p.id`).all() as Array<Record<string, unknown> & { id: number }>;
@@ -90,15 +116,19 @@ export class SelfHostedSync {
       seen.add(`${r.kind}:${r.local}`);
     }
   }
-  setup(input: { independent?: boolean; baseline?: Baseline; workProjectAliases?: string[][] }): { device: string; epoch: string; token: string } {
+  setup(input: { independent?: boolean; baseline?: Baseline; bootstrapPlan?: BootstrapPlan; workProjectAliases?: string[][] }): { device: string; epoch: string; token: string } {
     if (this.configured()) throw new Error('already configured; identity cannot be replaced');
     if (!input.independent && !input.baseline) throw new Error('choose verified shared baseline or explicitly independent history');
-    if (input.baseline && this.reconcile(input.baseline).ambiguous.length) throw new Error('baseline has changed/colliding rows; reconcile them on disposable copies before setup');
-    if (input.baseline) {
-      const localWork = new Set(this.rows('work').map(row => String(row.id)));
-      if (input.baseline.rows.some(row => row.kind === 'work' && !localWork.has(row.local))) throw new Error('partial work baseline cannot establish shared causality; reconcile complete event history first');
-    }
+    if (input.bootstrapPlan && !input.baseline) throw new Error('bootstrap plan requires a shared baseline');
+    if (input.baseline && input.independent) throw new Error('choose exactly one history mode');
     const result = this.db.transaction(() => {
+      const reviewed = input.bootstrapPlan ? validateBootstrapPlan(input.bootstrapPlan, input.baseline!, new Map(this.rows('session').map(row => [String(row.id), row]))) : new Map();
+      if (input.baseline) {
+        const report = this.reconcile(input.baseline);
+        if (report.ambiguous.some(row => row.kind !== 'session' || !reviewed.has(row.local))) throw new Error('baseline has changed/colliding rows; reconcile them on disposable copies before setup');
+        const localWork = new Set(this.rows('work').map(row => String(row.id)));
+        if (input.baseline.rows.some(row => row.kind === 'work' && !localWork.has(row.local))) throw new Error('partial work baseline cannot establish shared causality; reconcile complete event history first');
+      }
       this.createSchema();
       const previous = this.config();
       if (previous) throw new Error('disabled identity exists; use enable, do not replace its identity');
@@ -110,7 +140,13 @@ export class SelfHostedSync {
         for (const r of input.baseline.rows) {
           const row = byKind.get(r.kind)!.get(r.local);
           if (!row) continue;
-          this.map(r.kind, row.id, input.baseline.namespace, r.local, hash(null));
+          const reviewedSession = r.kind === 'session' ? reviewed.get(r.local) : undefined;
+          const mapping = this.map(r.kind, row.id, input.baseline.namespace, r.local, reviewedSession ? r.hash : hash(null));
+          if (reviewedSession) {
+            // Same revision as an unchanged peer, then capture() journals the
+            // current completion as its causal child without rewriting the row.
+            this.append(revision({ entity: mapping.entity, kind: 'session', owner: mapping.owner, local: mapping.local, actor: mapping.owner, parents: [], causes: [], payload: reviewedSession.baselinePayload, deleted: false }));
+          }
         }
       }
       this.configureWorkAliases(input.workProjectAliases ?? []);
@@ -178,6 +214,8 @@ export class SelfHostedSync {
   capture(): void {
     const { device } = this.requireConfig();
     this.db.transaction(() => {
+      const state = this.captureState();
+      if (state && state.revision === state.captured) return;
       this.assertUnambiguousWorkActivation();
       for (const kind of KINDS) {
         const existing = this.db.query('SELECT * FROM self_sync_map WHERE kind=?').all(kind) as Mapping[];
@@ -218,6 +256,7 @@ export class SelfHostedSync {
         }
       }
       this.rebuildWorkProjection();
+      this.acknowledgeCapture();
     })();
   }
   private append(op: Revision): boolean {
@@ -301,7 +340,7 @@ export class SelfHostedSync {
   }
   private ingest(packet: Packet): boolean {
     const p = this.peer(packet.sender)!;
-    let last = p.received, changed = false;
+    let last = p.received, changed = false, workChanged = false;
     if (packet.ack > this.head()) throw new Error('ack exceeds journal');
     for (const { seq, revision: op } of packet.changes) {
       if (seq <= p.received) {
@@ -314,17 +353,25 @@ export class SelfHostedSync {
       this.db.query('INSERT INTO self_sync_received(device,seq,id) VALUES(?,?,?)').run(packet.sender, seq, op.id);
       if (this.append(op)) {
         changed = true;
+        workChanged ||= op.kind === 'work';
         this.project(op);
       }
     }
-    this.assertUnambiguousWorkActivation();
-    this.rebuildWorkProjection();
+    // capture already refreshed local work. Duplicate pages and content-only
+    // pages cannot change its projection; avoid replaying every work event.
+    if (workChanged) {
+      this.assertUnambiguousWorkActivation();
+      this.rebuildWorkProjection();
+    }
     // Session tombstones may precede their content tombstones in the page.
     // A constraint conflict is retained, then retried once dependencies clear.
     for (const row of this.db.query('SELECT entity FROM self_sync_errors').all() as Array<{ entity: string }>) {
       const heads = this.heads(row.entity);
       if (heads.length === 1) this.project(this.getRevision(heads[0])!);
     }
+    // capture ran before ingest in this same transaction. All subsequent base
+    // writes were verified projections, so they must not become local edits.
+    this.acknowledgeCapture();
     this.options.beforeCheckpoint?.();
     this.db.query('UPDATE self_sync_peers SET received=?,sent=MAX(sent,?) WHERE device=?').run(last, packet.ack, packet.sender);
     return changed;
