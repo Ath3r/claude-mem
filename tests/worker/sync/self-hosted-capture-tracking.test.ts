@@ -40,3 +40,44 @@ it('indexes work journal selection without scanning content payloads', () => {
   const plan = db.query("EXPLAIN QUERY PLAN SELECT body FROM self_sync_log WHERE json_extract(body,'$.kind')='work' ORDER BY seq").all();
   expect(JSON.stringify(plan)).toContain('self_sync_log_kind_seq');
 });
+
+// Exercise the production guard with retained history, without clock thresholds.
+function historyFixture() {
+  const { db, sync } = fixture();
+  const entity = 'session:guard-fixture';
+  db.query("INSERT INTO self_sync_map VALUES(?, 'session', 'owner', '1', NULL, 'snapshot')").run(entity);
+  const append = (id: string, deleted: boolean, memory: string | null) => db.query('INSERT INTO self_sync_log(id,body) VALUES(?,?)').run(id, JSON.stringify({ kind: 'session', entity, deleted, payload: memory === null ? null : { memory_session_id: memory } }));
+  const heads = (...ids: string[]) => { db.query('DELETE FROM self_sync_heads').run(); for (const id of ids) db.query('INSERT INTO self_sync_heads VALUES(?,?)').run(entity, id); };
+  const blocked = (memory: string) => (sync as unknown as { hasDeletedSession(id: string): boolean }).hasDeletedSession(memory);
+  return { db, append, heads, blocked };
+}
+it('never inspects session history behind a live head when checking incoming content', () => {
+  const { db, append, heads, blocked } = historyFixture();
+  for (let i = 0; i < 50; i++) append(`revision-${i}`, false, `memory-${i}`);
+  heads('revision-49');
+  // A view makes an unused history row raise if SQLite evaluates its payload.
+  // Looking up the actual live head remains valid. This catches history scans
+  // before the deletion guard without clock thresholds or SQLite opcode offsets.
+  db.exec(`ALTER TABLE self_sync_log RENAME TO retained_log;
+    CREATE VIEW self_sync_log AS SELECT seq,id,
+      CASE WHEN id='revision-0' THEN json_extract('invalid-history-probe','$') ELSE body END AS body
+      FROM retained_log`);
+  expect(blocked('absent-memory')).toBe(false);
+  expect(blocked('memory-0')).toBe(false);
+});
+it('checks all prior identities for deleted or conflicted heads while allowing resolved live heads', () => {
+  const { db, append, heads, blocked } = historyFixture();
+  append('original', false, 'old-memory'); append('renamed', false, 'new-memory'); append('deleted', true, null); append('restored', false, 'new-memory');
+  heads('deleted');
+  expect(blocked('old-memory')).toBe(true);
+  expect(blocked('new-memory')).toBe(true);
+  expect(blocked('unrelated')).toBe(false);
+  heads('restored');
+  expect(blocked('old-memory')).toBe(false);
+  heads('restored', 'deleted');
+  expect(blocked('old-memory')).toBe(true);
+  // Pre-compat stores may lack the kind index; safety does not depend on it.
+  db.exec('DROP INDEX self_sync_log_kind_seq');
+  expect(blocked('new-memory')).toBe(true);
+  expect(blocked('unrelated')).toBe(false);
+});
