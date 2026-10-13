@@ -21,9 +21,15 @@ of completion-only `bootstrapPlan`. Bind the entire plan to the original manifes
 and each member to its baseline/current hashes, old/new non-null references and
 original payload. Require a complete baseline on the accepting device and exact
 closure of the current linked graph. Reject omitted/extra/duplicate members,
-missing baseline rows, independent dependents, reference collisions, non-reference
+missing baseline rows, unreviewed independent dependents, reference collisions, non-reference
 field changes and stale evidence. The original payload plus its original hash
 proves the old graph; reconciliation rejects any changed row outside the plan.
+
+The complete private graph also has 398 post-baseline dependents (321 observations,
+30 summaries, 47 prompts). List them explicitly in `independentRows` with a null
+expected baseline hash and exact current hash. Require their absence from the
+manifest and null prior ownership, and keep ordinary device-owned capture roots.
+A missing graph member, changed payload or pre-existing owner is a rejection.
 
 Validate under setup's IMMEDIATE transaction before creating state. Seed original
 shared roots with the original owner/local identity, then let ordinary capture

@@ -185,7 +185,7 @@ describe('self-hosted worker routes and manual CLI', () => {
     a.store.updateMemorySessionId(1, 'new');
     const manifest = join(dir, 'baseline.json'), plan = join(dir, 'reviewed.json'), config = join(dir, 'sync.json');
     writeFileSync(manifest, JSON.stringify(baseline), { mode: 0o600 });
-    writeFileSync(plan, JSON.stringify({ protocol: baseline.protocol, namespace: baseline.namespace, schema: baseline.schema, manifestHash: hash(baseline), sessionLocal: '1', oldMemorySessionId: 'old', newMemorySessionId: 'new', reason: 'Reviewed complete reference graph', rows: [{kind: 'session', local: '1', expectedHash: hash(old), currentHash: hash(payload()), baselinePayload: old }] }), { mode: 0o600 });
+    writeFileSync(plan, JSON.stringify({ protocol: baseline.protocol, namespace: baseline.namespace, schema: baseline.schema, manifestHash: hash(baseline), sessionLocal: '1', oldMemorySessionId: 'old', newMemorySessionId: 'new', reason: 'Reviewed complete reference graph', independentRows: [], rows: [{kind: 'session', local: '1', expectedHash: hash(old), currentHash: hash(payload()), baselinePayload: old }] }), { mode: 0o600 });
     expect((await cli(dir, 'setup', '--worker', a.url, '--config', config, '--manifest', manifest, '--bootstrap-plan', plan)).code).toBe(1);
     expect(a.sync.configured()).toBe(false);
     const result = await cli(dir, 'setup', '--worker', a.url, '--config', config, '--manifest', manifest, '--session-remap-plan', plan);
