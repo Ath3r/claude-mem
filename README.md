@@ -59,7 +59,7 @@
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
   </a>
   <a href="package.json">
-    <img src="https://img.shields.io/badge/version-13.35.0-green.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-13.37.0-green.svg" alt="Version">
   </a>
   <a href="package.json">
     <img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg" alt="Node">
@@ -257,7 +257,6 @@ The installer handles dependencies, plugin setup, AI provider configuration, wor
 
 - **[Configuration](https://docs.claude-mem.ai/configuration)** - Environment variables & settings
 - **[Development](https://docs.claude-mem.ai/development)** - Building, testing, contributing
-- **[Release Branches](https://docs.claude-mem.ai/branches)** - Stable, core-dev, and community-edge branch flow
 - **[Troubleshooting](https://docs.claude-mem.ai/troubleshooting)** - Common issues & solutions
 
 ---
@@ -313,15 +312,6 @@ get_observations(ids=[123, 456])
 ```
 
 See [Search Tools Guide](https://docs.claude-mem.ai/usage/search-tools) for detailed examples.
-
----
-
-## Release Branches
-
-Stable releases ship from `main` and are published to npm. `core-dev` and
-`community-edge` are source-run branches for early reliability fixes and
-community integrations. See **[Release Branches](https://docs.claude-mem.ai/branches)**
-for the branch flow and non-stable run instructions.
 
 ---
 
@@ -426,12 +416,9 @@ Contributions are welcome! Please:
 2. Create a feature branch
 3. Make your changes with tests
 4. Update documentation
-5. Submit a Pull Request
+5. Submit a Pull Request against `main`
 
-Claude-Mem ships from three branches: `main` (stable), `core-dev`, and
-`community-edge`. Only `main` is published to npm; the others are run from
-source. See [Release Branches](https://docs.claude-mem.ai/branches) for the
-strategy and local run instructions.
+Releases ship from `main` and are published to npm.
 
 See [Development Guide](https://docs.claude-mem.ai/development) for contribution workflow.
 
