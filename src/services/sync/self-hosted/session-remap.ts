@@ -17,6 +17,12 @@ const schema = z.object({
     expectedHash: digest, currentHash: digest,
     baselinePayload: z.record(z.string(), z.unknown()),
   }).strict()).min(1).max(4096),
+  // Explicitly reviewed new dependents are not baseline exceptions. They keep
+  // ordinary device-owned roots; never infer independence from a hash mismatch.
+  independentRows: z.array(z.object({
+    kind: z.enum(['observation', 'summary', 'prompt']), local,
+    expectedHash: z.null(), currentHash: digest,
+  }).strict()).max(4096),
 }).strict();
 export type SessionRemapPlan = z.infer<typeof schema>;
 type Row = Record<string, unknown> & { id: number };
@@ -51,6 +57,15 @@ export function validateSessionRemapPlan(input: unknown, baseline: Baseline, row
   if (!session || plan.rows.filter(r => r.kind === 'session').length !== 1) throw new Error('session remap requires exactly one parent');
   const contentId = session.baselinePayload.content_session_id;
   const platform = session.baselinePayload.platform_source;
+  const approved = new Set(reviewed.keys());
+  for (const entry of plan.independentRows) {
+    const k = key(entry.kind, entry.local), row = current.get(k);
+    if (!row || known.has(k) || approved.has(k) || row.origin_device_id != null || row.origin_local_id != null) throw new Error('session remap independent identity collision');
+    const payload = portablePayload(entry.kind, row);
+    if (payload.memory_session_id !== plan.newMemorySessionId || hash(payload) !== entry.currentHash) throw new Error('session remap independent current hash/reference mismatch');
+    revision({ kind: entry.kind, entity: entityId(entry.kind, plan.namespace, entry.local), owner: plan.namespace, local: entry.local, actor: plan.namespace, parents: [], causes: [], payload, deleted: false });
+    approved.add(k);
+  }
   const closure = new Set<string>();
   for (const [kind, values] of rows) {
     if (kind === 'work') continue;
@@ -68,6 +83,6 @@ export function validateSessionRemapPlan(input: unknown, baseline: Baseline, row
       }
     }
   }
-  if (closure.size !== reviewed.size || [...closure].some(k => !reviewed.has(k))) throw new Error('session remap incomplete or conflicting graph');
+  if (closure.size !== approved.size || [...closure].some(k => !approved.has(k))) throw new Error('session remap incomplete or conflicting graph');
   return reviewed;
 }

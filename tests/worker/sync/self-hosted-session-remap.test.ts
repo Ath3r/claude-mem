@@ -25,7 +25,7 @@ function fixture() {
   a.updateMemorySessionId(1, 'codex-shared-1791849600000');
   const plan: SessionRemapPlan = {
     protocol: baseline.protocol, namespace: baseline.namespace, schema: baseline.schema, manifestHash: hash(baseline),
-    sessionLocal: '1', oldMemorySessionId: 'old', newMemorySessionId: 'codex-shared-1791849600000', reason: 'Reviewed provider reference change with complete graph',
+    sessionLocal: '1', oldMemorySessionId: 'old', newMemorySessionId: 'codex-shared-1791849600000', reason: 'Reviewed provider reference change with complete graph', independentRows: [],
     rows: baseline.rows.map(r => ({ ...r, kind: r.kind as SessionRemapPlan['rows'][number]['kind'], expectedHash: r.hash, currentHash: hash(portablePayload(r.kind, rows(a, r.kind).find(row => String(row.id) === r.local)!)), baselinePayload: old[r.kind][Number(r.local)-1] })).map(({ hash: _, ...r }) => r),
   };
   return { a, b, left, right, baseline, plan };
@@ -78,6 +78,25 @@ describe('audited whole-session reference bootstrap', () => {
     const f=fixture();mutate(f);const before=native(f.a);
     expect(()=>f.left.setup({baseline:f.baseline,sessionRemapPlan:f.plan})).toThrow();
     expect(native(f.a)).toEqual(before);expect(f.left.configured()).toBe(false);expect(f.a.db.query("SELECT name FROM sqlite_master WHERE name LIKE 'self_sync_%'").all()).toEqual([]);
+  });
+  it('requires hash-bound review of every independent dependent and preserves its device ownership',()=>{
+    const f=fixture();
+    f.a.db.exec("INSERT INTO observations(memory_session_id,project,type,narrative,created_at,created_at_epoch) VALUES('codex-shared-1791849600000','project','discovery','new local content','2026-10-13T00:00:00.000Z',1791849600000)");
+    const row=rows(f.a,'observation').at(-1)!;
+    f.plan.independentRows.push({kind:'observation',local:String(row.id),expectedHash:null,currentHash:hash(portablePayload('observation',row))});
+    const before=portable(f.a); f.left.setup({baseline:f.baseline,sessionRemapPlan:f.plan}); f.right.setup({baseline:f.baseline});settle(f.left,f.right);
+    for(const s of [f.a,f.b]) {expect(portable(s)).toEqual(before);expect(s.db.query("SELECT owner,local FROM self_sync_map WHERE kind='observation' AND local='14'").get()).toEqual({owner:f.left.status().device,local:'14'});}
+    expect(f.left.status().conflicts).toEqual([]);expect(f.right.status().projectionErrors).toEqual([]);
+  });
+  for(const drift of ['missing','stale','duplicate','baseline','foreign-owner']) it(`rejects independent member ${drift}`,()=>{
+    const f=fixture();f.a.db.exec("INSERT INTO observations(memory_session_id,project,type,narrative,created_at,created_at_epoch) VALUES('codex-shared-1791849600000','project','discovery','new local content','2026-10-13T00:00:00.000Z',1791849600000)");
+    const row=rows(f.a,'observation').at(-1)!;f.plan.independentRows=[{kind:'observation',local:String(row.id),expectedHash:null,currentHash:hash(portablePayload('observation',row))}];
+    if(drift==='missing')f.plan.independentRows=[];
+    if(drift==='stale')f.a.db.exec("UPDATE observations SET narrative='later' WHERE id=14");
+    if(drift==='duplicate')f.plan.independentRows.push(f.plan.independentRows[0]);
+    if(drift==='baseline')f.plan.independentRows[0].local='1';
+    if(drift==='foreign-owner')f.a.db.query('UPDATE observations SET origin_device_id=?,origin_local_id=? WHERE id=14').run(crypto.randomUUID(),'14');
+    const before=native(f.a);expect(()=>f.left.setup({baseline:f.baseline,sessionRemapPlan:f.plan})).toThrow();expect(native(f.a)).toEqual(before);expect(f.left.configured()).toBe(false);
   });
   it('rolls back graph roots, provenance, and identity when later setup validation fails',()=>{
     const f=fixture(),before=native(f.a);
