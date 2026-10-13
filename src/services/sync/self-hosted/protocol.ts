@@ -41,7 +41,7 @@ export const CONTENT_FIELDS = {
 } as const;
 const sessionSchema = z.object({
   content_session_id: z.string().min(1).max(4096), memory_session_id: z.string().min(1).max(4096).nullable(),
-  project: z.string().min(1).max(4096), platform_source: z.string().min(1).max(128),
+  project: z.string().max(4096), platform_source: z.string().min(1).max(128),
   user_prompt: z.string().nullable(), custom_title: z.string().nullable(),
   started_at: z.string().datetime(), started_at_epoch: sequence,
   completed_at: z.string().datetime().nullable(), completed_at_epoch: sequence.nullable(),
@@ -75,7 +75,11 @@ export function validateRevision(input: unknown): Revision {
     if (value.kind === 'session') sessionSchema.parse(value.payload);
     else if (value.kind === 'work') workSchema.parse(value.payload);
     else {
-      buildContentOperation({ kind: value.kind, originDeviceId: value.owner, originLocalId: value.local, entityRev: '1', payload: value.payload });
+      // Legacy SQLite content may have an exactly empty project. Permit it only
+      // on this private lane: canonical validation sees a proxy, while the
+      // revision identity, returned payload and native projection retain ''.
+      const validationPayload = value.payload.project === '' ? { ...value.payload, project: 'legacy' } : value.payload;
+      buildContentOperation({ kind: value.kind, originDeviceId: value.owner, originLocalId: value.local, entityRev: '1', payload: validationPayload });
       for (const key of DECIMAL_FIELDS) if (value.payload[key] != null) canonicalDecimalToSafeInteger(value.payload[key], key);
     }
   }

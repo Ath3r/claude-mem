@@ -22,7 +22,7 @@ export async function workerRequest(connection: SyncConnection, route: string, b
   if (input !== undefined && Buffer.byteLength(input) > limit) throw new Error('worker request exceeds size limit');
   const response = await fetch(`${loopbackWorker(connection.worker)}${endpoint(route)}`, {
     method: body === undefined ? 'GET' : 'POST', headers: { 'content-type': 'application/json', ...(connection.token ? { authorization: `Bearer ${validateToken(connection.token)}` } : {}) },
-    ...(body !== undefined ? { body: input } : {}), signal: AbortSignal.timeout(30_000),
+    ...(body !== undefined ? { body: input } : {}), signal: AbortSignal.timeout(route === 'setup' ? 300_000 : 30_000),
   });
   const text = await boundedResponse(response, route === 'baseline' ? MAX_BASELINE_BYTES : MAX_PACKET_BYTES);
   if (!response.ok) {
@@ -48,13 +48,14 @@ export function sshRequest(connection: SshConnection, route: string, body?: unkn
   const auth = connection.token ? ` -H 'Authorization: Bearer ${validateToken(connection.token)}'` : '';
   const method = body === undefined ? '' : " -H 'Content-Type: application/json' --data-binary @-";
   const limit = route === 'baseline' ? MAX_BASELINE_BYTES : MAX_PACKET_BYTES;
-  const command = `curl --silent --show-error --fail --max-time 30 --max-filesize ${limit}${auth}${method} http://127.0.0.1:${connection.port}${endpoint(route)}`;
+  const timeoutSeconds = route === 'setup' ? 300 : 30;
+  const command = `curl --silent --show-error --fail --max-time ${timeoutSeconds} --max-filesize ${limit}${auth}${method} http://127.0.0.1:${connection.port}${endpoint(route)}`;
   const input = body === undefined ? '' : JSON.stringify(body);
   if (Buffer.byteLength(input) > (LARGE_SYNC_BODY_LIMITS[endpoint(route)] ?? MAX_PACKET_BYTES)) throw new Error('SSH request exceeds size limit');
   return new Promise((resolve, reject) => {
     const child = spawn('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', connection.target, command], { stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0, settled = false;
-    const timeout = setTimeout(() => { child.kill('SIGTERM'); finish(new Error('SSH request timed out')); }, 45_000);
+    const timeout = setTimeout(() => { child.kill('SIGTERM'); finish(new Error('SSH request timed out')); }, (timeoutSeconds + 15) * 1000);
     function finish(error?: Error) {
       if (settled) return;
       settled = true;

@@ -382,7 +382,7 @@ export class SyncApply {
     this.now = options.now ?? Date.now;
   }
 
-  /** Private fork transport: caller owns the transaction and causal revision guard.
+  /** Private fork transport: caller owns validation, the transaction and causal revision guard.
    * No cloud cursor/head is changed and no side effects run before its commit.
    */
   applySelfHostedRow(op: SyncOp): number | null {
@@ -394,7 +394,7 @@ export class SyncApply {
       return old?.id ?? null;
     }
     const projected = { ...op, rev: incrementCanonicalDecimal(old?.sync_rev ?? '0') };
-    if (this.applyRowOp(projected, []) !== 'applied') throw new Error('content identity collided with an independently created row');
+    if (this.applyRowOp(projected, [], true) !== 'applied') throw new Error('content identity collided with an independently created row');
     return this.findByOrigin(table, op.origin_device, op.origin_id)?.id ?? null;
   }
 
@@ -848,15 +848,15 @@ export class SyncApply {
     return outcome;
   }
 
-  private applyRowOp(op: SyncOp, chromaJobs: ChromaJob[]): 'applied' | 'stale' {
+  private applyRowOp(op: SyncOp, chromaJobs: ChromaJob[], allowEmptyProject = false): 'applied' | 'stale' {
     const body = this.parseBody(op);
     switch (op.kind) {
       case 'observation':
-        return this.applyObservation(op, body, chromaJobs);
+        return this.applyObservation(op, body, chromaJobs, allowEmptyProject);
       case 'summary':
-        return this.applySummary(op, body, chromaJobs);
+        return this.applySummary(op, body, chromaJobs, allowEmptyProject);
       case 'prompt':
-        return this.applyPrompt(op, body, chromaJobs);
+        return this.applyPrompt(op, body, chromaJobs, allowEmptyProject);
       default:
         throw invalidOp(op, `unknown row kind`);
     }
@@ -1028,12 +1028,12 @@ export class SyncApply {
     return sessionId;
   }
 
-  private applyObservation(op: SyncOp, body: Record<string, unknown>, chromaJobs: ChromaJob[]): 'applied' | 'stale' {
+  private applyObservation(op: SyncOp, body: Record<string, unknown>, chromaJobs: ChromaJob[], allowEmptyProject: boolean): 'applied' | 'stale' {
     const memorySessionId = fieldString(op, body, 'memory_session_id');
     const project = fieldString(op, body, 'project');
     const type = fieldString(op, body, 'type');
     const createdAtEpoch = fieldNumber(op, body, 'created_at_epoch');
-    if (!memorySessionId || !project || !type || createdAtEpoch === null) {
+    if (!memorySessionId || project === null || (!allowEmptyProject && project === '') || !type || createdAtEpoch === null) {
       throw invalidOp(op, 'observation body requires memory_session_id, project, type, created_at_epoch');
     }
     const createdAt = fieldString(op, body, 'created_at') ?? new Date(createdAtEpoch).toISOString();
@@ -1144,11 +1144,11 @@ export class SyncApply {
     }
   }
 
-  private applySummary(op: SyncOp, body: Record<string, unknown>, chromaJobs: ChromaJob[]): 'applied' | 'stale' {
+  private applySummary(op: SyncOp, body: Record<string, unknown>, chromaJobs: ChromaJob[], allowEmptyProject: boolean): 'applied' | 'stale' {
     const memorySessionId = fieldString(op, body, 'memory_session_id');
     const project = fieldString(op, body, 'project');
     const createdAtEpoch = fieldNumber(op, body, 'created_at_epoch');
-    if (!memorySessionId || !project || createdAtEpoch === null) {
+    if (!memorySessionId || project === null || (!allowEmptyProject && project === '') || createdAtEpoch === null) {
       throw invalidOp(op, 'summary body requires memory_session_id, project, created_at_epoch');
     }
     const createdAt = fieldString(op, body, 'created_at') ?? new Date(createdAtEpoch).toISOString();
@@ -1223,7 +1223,7 @@ export class SyncApply {
   }
 
   /** Resolve the local sdk_sessions id for a remote prompt, or NULL (orphan). */
-  private resolvePromptSession(op: SyncOp, body: Record<string, unknown>, createdAtEpoch: number): number | null {
+  private resolvePromptSession(op: SyncOp, body: Record<string, unknown>, createdAtEpoch: number, allowEmptyProject = false): number | null {
     const memorySessionId = fieldString(op, body, 'memory_session_id');
     if (memorySessionId) {
       return this.ensureSessionForMemoryId(
@@ -1248,7 +1248,7 @@ export class SyncApply {
     // either: orphan it, and the set_prompt_session repair op links it once
     // the origin registers.
     const project = fieldString(op, body, 'project');
-    if (!project || project === 'unknown') return null;
+    if (project === null || (!allowEmptyProject && project === '') || project === 'unknown') return null;
     // A real project means the origin's session exists but has no memory id.
     // A session whose memory agent never started never gets one, so no repair
     // op would come: create the content-keyed session the origin has.
@@ -1257,7 +1257,7 @@ export class SyncApply {
     return sessionId;
   }
 
-  private applyPrompt(op: SyncOp, body: Record<string, unknown>, chromaJobs: ChromaJob[]): 'applied' | 'stale' {
+  private applyPrompt(op: SyncOp, body: Record<string, unknown>, chromaJobs: ChromaJob[], allowEmptyProject: boolean): 'applied' | 'stale' {
     const contentSessionId = fieldString(op, body, 'content_session_id');
     const promptNumber = fieldNumber(op, body, 'prompt_number');
     const promptText = fieldString(op, body, 'prompt_text');
@@ -1270,7 +1270,7 @@ export class SyncApply {
     const existing = this.findByOrigin('user_prompts', op.origin_device, op.origin_id);
     if (existing) {
       if (compareCanonicalDecimals(op.rev, existing.sync_rev) <= 0) return 'stale';
-      const sessionDbId = this.resolvePromptSession(op, body, createdAtEpoch);
+      const sessionDbId = this.resolvePromptSession(op, body, createdAtEpoch, allowEmptyProject);
       this.db.prepare(`
         UPDATE user_prompts SET
           session_db_id = ?, content_session_id = ?, prompt_number = ?, prompt_text = ?,
@@ -1285,7 +1285,7 @@ export class SyncApply {
       return 'applied';
     }
 
-    const sessionDbId = this.resolvePromptSession(op, body, createdAtEpoch);
+    const sessionDbId = this.resolvePromptSession(op, body, createdAtEpoch, allowEmptyProject);
     const inserted = this.db.prepare(`
       INSERT INTO user_prompts
         (session_db_id, content_session_id, prompt_number, prompt_text, created_at, created_at_epoch,
