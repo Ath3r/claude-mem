@@ -48,7 +48,7 @@ import { isSubagentEvent } from '../../shared/subagent-predicate.js';
 import { findRecentDuplicateUserPrompt as findRecentDuplicateUserPromptRecord } from './prompts/get.js';
 import { normalizeStoredPromptText, MEDIA_PROMPT_PLACEHOLDER } from './prompt-storage.js';
 import { stripMemoryTags } from '../../utils/tag-stripping.js';
-import { applySqliteConnectionPragmas } from './connection.js';
+import { applySqliteConnectionPragmas, assertSchemaWriterCompatible, claimSchemaWriter, LATEST_SCHEMA_VERSION } from './connection.js';
 import { streamRows } from './stream-rows.js';
 import { OBSERVATIONS_FTS_TRIGGERS_SQL, SESSION_SUMMARIES_FTS_TRIGGERS_SQL } from './SessionSearch.js';
 import {
@@ -205,7 +205,24 @@ export class SessionStore {
       this.db = new Database(dbPathOrDb);
     }
 
+    // Refuse before any DDL — pragmas included — when the database's schema
+    // is newer than this binary's chain (#3609 step 2); a refused open
+    // touches nothing.
+    assertSchemaWriterCompatible(this.db, LATEST_SCHEMA_VERSION);
+
     applySqliteConnectionPragmas(this.db);
+
+    // Record the highest schema version this binary knows before the first
+    // schema write, not after the chain: the chain's steps commit separately,
+    // so a mid-chain failure (say the v46 REAL-revision refusal) leaves
+    // earlier DDL on disk, and a stamp deferred to the end would leave that
+    // partially-upgraded database adoptable by an older binary — the exact
+    // downgrade the stamp exists to refuse (#4602 review). Stamping first
+    // names this schema on any state it touched; the idempotent chain re-runs
+    // to completion on the next open by this same or a newer-chain binary.
+    // The re-check and the stamp commit under one write lock, so a newer
+    // worker that stamped after the check above still refuses this one.
+    claimSchemaWriter(this.db, LATEST_SCHEMA_VERSION);
 
     this.initializeSchema();
 
@@ -3734,7 +3751,8 @@ export class SessionStore {
     promptNumber?: number,
     discoveryTokens: number = 0,
     overrideTimestampEpoch?: number,
-    generatedByModel?: string
+    generatedByModel?: string,
+    options: { skipTitleDedup?: boolean } = {}
   ): { id: number; createdAtEpoch: number; mergedIntoExisting: boolean } {
     // storeObservations skips empty-title rows, which would leave no id to return here.
     // This wrapper stores exactly one observation, so require a title up front rather than
@@ -3751,7 +3769,8 @@ export class SessionStore {
       promptNumber,
       discoveryTokens,
       overrideTimestampEpoch,
-      generatedByModel
+      generatedByModel,
+      options
     );
 
     return {
@@ -3841,7 +3860,8 @@ export class SessionStore {
     promptNumber?: number,
     discoveryTokens: number = 0,
     overrideTimestampEpoch?: number,
-    generatedByModel?: string
+    generatedByModel?: string,
+    options: { skipTitleDedup?: boolean } = {}
   ): {
     observationIds: number[];
     /** Parallel to observationIds: true where a Tier-0 merge reused an existing row (nothing new was stored). */
@@ -3917,7 +3937,9 @@ export class SessionStore {
             continue;
           }
 
-          const canonical = findTier0Canonical(this.db, project, titleNormKey);
+          // Authored note revisions may keep a title while changing their facts.
+          // They still dedupe exact content, but must not collapse by title alone.
+          const canonical = options.skipTitleDedup ? null : findTier0Canonical(this.db, project, titleNormKey);
           if (canonical) {
             this.db.prepare('UPDATE observations SET occurrence_count = occurrence_count + 1 WHERE id = ?').run(canonical.id);
             reinforceObservation(this.db, canonical.id, reconfirmedOn);
