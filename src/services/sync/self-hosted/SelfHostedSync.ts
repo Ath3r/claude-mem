@@ -466,7 +466,15 @@ export class SelfHostedSync {
           id = Number(this.db.query(`INSERT INTO sdk_sessions(${columns.join(',')}) VALUES(${columns.map(() => '?').join(',')})`).run(...SESSION_FIELDS.map(k => bind(p[k])), 'completed').lastInsertRowid);
         } else {
           const dependents = this.sessionDependents(id);
+          const previous = this.db.query('SELECT memory_session_id FROM sdk_sessions WHERE id=?').get(id) as { memory_session_id: string | null };
           this.db.query(`UPDATE sdk_sessions SET ${SESSION_FIELDS.map(k => `${k}=?`).join(',')} WHERE id=?`).run(...SESSION_FIELDS.map(k => bind(p[k])), id);
+          // Receipts are local processing state, not portable revisions. Unlike
+          // observations/summaries their memory reference has no cascading FK.
+          // Carry only references to this exact previous parent key; unrelated
+          // historical or unbound receipts retain all their original fields.
+          if (previous.memory_session_id !== null && p.memory_session_id !== null && previous.memory_session_id !== p.memory_session_id) {
+            this.db.query('UPDATE tool_uses SET memory_session_id=? WHERE session_db_id=? AND memory_session_id=?').run(bind(p.memory_session_id), id, previous.memory_session_id);
+          }
           this.recordProjectionEffects(r, dependents);
         }
       } else if (r.kind === 'work') {

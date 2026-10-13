@@ -103,6 +103,24 @@ describe('audited whole-session reference bootstrap', () => {
     expect(()=>f.left.setup({baseline:f.baseline,sessionRemapPlan:f.plan,workProjectAliases:[['only-one']]})).toThrow('invalid work project aliases');
     expect(native(f.a)).toEqual(before);expect(f.a.db.query("SELECT name FROM sqlite_master WHERE name LIKE 'self_sync_%'").all()).toEqual([]);
   });
+  for (const failFirst of [false,true]) it(`preserves local receipts and atomically carries exact old references (rollback=${failFirst})`,()=>{
+    const f=fixture();
+    for (const [id,ref] of [['old-receipt','old'],['unbound',null],['historic','historic-reference']] as const) f.b.db.query("INSERT INTO tool_uses(tool_use_id,content_session_id,memory_session_id,session_db_id,project,tool_name,tool_input,tool_response,created_at,created_at_epoch) VALUES(?,'shared',?,1,'project','Read','private input','private response','2026-10-12T00:00:00.000Z',1791763200000)").run(id,ref);
+    const before=f.b.db.query('SELECT * FROM tool_uses ORDER BY id').all() as any[];
+    f.left.setup({baseline:f.baseline,sessionRemapPlan:f.plan});f.right.setup({baseline:f.baseline});
+    if(failFirst)f.b.db.exec("CREATE TRIGGER reject_receipt_reference BEFORE UPDATE OF memory_session_id ON tool_uses BEGIN SELECT RAISE(ABORT,'receipt fault'); END");
+    settle(f.left,f.right);
+    if(failFirst){
+      expect(f.b.db.query('SELECT * FROM tool_uses ORDER BY id').all()).toEqual(before);
+      expect((f.b.db.query('SELECT memory_session_id FROM sdk_sessions WHERE id=1').get() as any).memory_session_id).toBe('old');
+      expect(f.right.status().projectionErrors.length).toBeGreaterThan(0);
+      f.b.db.exec('DROP TRIGGER reject_receipt_reference');settle(f.left,f.right);
+    }
+    const after=f.b.db.query('SELECT * FROM tool_uses ORDER BY id').all();
+    expect(after).toEqual(before.map(r=>({...r,memory_session_id:r.memory_session_id==='old'?f.plan.newMemorySessionId:r.memory_session_id})));
+    expect(f.right.status().projectionErrors).toEqual([]);expect(f.right.status().conflicts).toEqual([]);
+    const heads=[f.left.head(),f.right.head()];settle(f.left,f.right);expect([f.left.head(),f.right.head()]).toEqual(heads);
+  });
   it('retains genuine concurrent session edits as conflicts',()=>{
     const f=fixture();f.right.setup({baseline:f.baseline});f.b.db.exec("UPDATE sdk_sessions SET custom_title='concurrent' WHERE id=1");f.right.capture();
     f.left.setup({baseline:f.baseline,sessionRemapPlan:f.plan});settle(f.left,f.right);

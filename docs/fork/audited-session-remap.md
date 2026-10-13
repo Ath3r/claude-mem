@@ -36,6 +36,12 @@ shared roots with the original owner/local identity, then let ordinary capture
 append local causal deltas, without rewriting portable rows. Keep the Pro guard,
 auth rules, baseline updater and completion-only validator unchanged.
 
+Receiver projection also carries local tool receipt references that match the
+exact prior parent key. Receipts have no cascading memory-reference FK. Keep all
+receipt payloads and unrelated historical/null references intact, in the same
+projection savepoint as the parent and ordinary dependent cascade. A receipt
+failure must roll back the parent too; no receipt is transferred between devices.
+
 ## Verification contract
 
 Tests must prove all four kinds retain native content, ownership, FKs and root
