@@ -14,6 +14,8 @@ import { sshRequest, loopbackWorker, workerRequest } from '../../../src/services
 import { createMiddleware } from '../../../src/services/worker/http/middleware.js';
 import { PROTOCOL, MAX_PACKET_BYTES, MAX_BASELINE_BYTES, MAX_ACCEPT_BYTES } from '../../../src/services/sync/self-hosted/protocol.js';
 import { parsePacket } from '../../../src/services/sync/self-hosted/protocol.js';
+import { canonicalJson, sha256Base64Url } from '../../../src/services/sync/CanonicalContent.js';
+import { portablePayload } from '../../../src/services/sync/self-hosted/protocol.js';
 import { logger } from '../../../src/utils/logger.js';
 
 const cleanup: Array<() => void> = [];
@@ -154,6 +156,24 @@ describe('self-hosted worker routes and manual CLI', () => {
     expect(messages).toContainEqual(['SYNC_APPLY', 'Private sync worker request rejected', { route: 'status', status: 401 }]);
     expect(JSON.stringify(messages)).not.toContain(secret);
     expect(JSON.stringify(messages)).not.toContain(token);
+  });
+  it('passes a reviewed bootstrap plan through the real CLI and setup route', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cmem-bootstrap-cli-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const a = await worker(dir, 'a');
+    a.store.db.query("INSERT INTO sdk_sessions(content_session_id,project,started_at,started_at_epoch,status) VALUES('shared','project','2026-10-12T00:00:00.000Z',1,'completed')").run();
+    const hash = (v: unknown) => sha256Base64Url(canonicalJson(v));
+    const payload = () => portablePayload('session', a.store.db.query('SELECT * FROM sdk_sessions').get() as Record<string, unknown>);
+    const baseline = a.sync.baseline(), old = payload();
+    a.store.db.query('UPDATE sdk_sessions SET completed_at=?,completed_at_epoch=?').run('2026-10-13T00:00:00.000Z', Date.parse('2026-10-13T00:00:00.000Z'));
+    const manifest = join(dir, 'baseline.json'), plan = join(dir, 'reviewed.json'), config = join(dir, 'sync.json');
+    writeFileSync(manifest, JSON.stringify(baseline), { mode: 0o600 });
+    writeFileSync(plan, JSON.stringify({ protocol: baseline.protocol, namespace: baseline.namespace, schema: baseline.schema, manifestHash: hash(baseline), sessions: [{ local: '1', expectedHash: hash(old), currentHash: hash(payload()), allowedFields: ['completed_at', 'completed_at_epoch'], baselinePayload: old, reason: 'Reviewed completion only' }] }), { mode: 0o600 });
+    expect((await cli(dir, 'setup', '--worker', a.url, '--config', config, '--manifest', manifest)).code).toBe(1);
+    expect(a.sync.configured()).toBe(false);
+    const result = await cli(dir, 'setup', '--worker', a.url, '--config', config, '--manifest', manifest, '--bootstrap-plan', plan);
+    expect(result.code).toBe(0); expect(result.stderr).toBe('');
+    expect(a.sync.head()).toBe(2);
+    expect(a.store.db.query('SELECT completed_at_epoch FROM sdk_sessions').get()).toEqual({ completed_at_epoch: Date.parse('2026-10-13T00:00:00.000Z') });
   });
   it('baseline and reconcile CLI read explicit disposable stores without enabling or migrating them', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cmem-baseline-cli-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));

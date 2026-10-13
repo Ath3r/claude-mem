@@ -23,6 +23,7 @@ import { getParkedSlotWaiterCount } from '../../../../supervisor/process-registr
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
 import { assertCanonicalDecimal, type ContentKind } from '../../../sync/CanonicalContent.js';
 import type { CloudSync } from '../../../sync/CloudSync.js';
+import { PROTOCOL as PRIVATE_SYNC_PROTOCOL } from '../../../sync/self-hosted/protocol.js';
 import { emitContextInvalidation } from '../../../../shared/context-invalidation.js';
 
 const integerArrayLike = z.preprocess((value) => {
@@ -484,27 +485,59 @@ export class DataRoutes extends BaseRouteHandler {
 
     const store = this.dbManager.getSessionStore();
     const row = store.db.prepare(`
-      SELECT CAST(id AS TEXT) AS id FROM ${table}
-      WHERE id = ? AND origin_device_id IS NULL
-    `).get(originLocalId) as { id: string } | undefined;
-    if (!row) {
+      SELECT CAST(id AS TEXT) AS id, origin_device_id FROM ${table}
+      WHERE id = ?
+    `).get(originLocalId) as { id: string; origin_device_id: string | null } | undefined;
+    const cloudSync = this.dbManager.getCloudSync();
+    const privateOwned = row?.origin_device_id != null
+      && kind === 'observation'
+      && !cloudSync?.isConfigured()
+      && this.isLocallyOwnedPrivateObservation(store, originLocalId);
+    if (!row || (row.origin_device_id !== null && !privateOwned)) {
       this.notFound(res, `${kind} #${originLocalId} not found`);
       return;
     }
 
-    const cloudSync = this.dbManager.getCloudSync();
     const check = this.assertRowDeletable(cloudSync, store, kind, originLocalId);
     if (!check.ok) {
       res.status(check.status).json({ error: check.error });
       return;
     }
 
-    const entityRev = this.commitRowDelete(cloudSync, store, kind, table, originLocalId);
+    let entityRev: string | null = null;
+    if (privateOwned) {
+      // Keep the private mapping and immutable journal. Normal capture (before
+      // every exchange) observes the missing row and appends its causal tombstone.
+      store.db.prepare('DELETE FROM observations WHERE id = ?').run(originLocalId);
+    } else {
+      entityRev = this.commitRowDelete(cloudSync, store, kind, table, originLocalId);
+    }
     emitContextInvalidation('all', `delete-${kind}`, 'removal');
 
     // Only after the delete committed: open viewer tabs drop the row live.
     this.sseBroadcaster.broadcast({ type: 'item_deleted', itemType: kind, id: Number(originLocalId) });
     res.json({ success: true, id: originLocalId, kind, entity_rev: entityRev });
+  }
+
+  private isLocallyOwnedPrivateObservation(
+    store: ReturnType<DatabaseManager['getSessionStore']>,
+    id: string,
+  ): boolean {
+    // These opt-in tables are absent on ordinary/Pro installations. An origin
+    // stamp alone never grants ownership; peer and shared-baseline owners deny.
+    const tables = store.db.prepare(`
+      SELECT COUNT(*) AS n FROM sqlite_master
+      WHERE type = 'table' AND name IN ('self_sync_config', 'self_sync_map')
+    `).get() as { n: number };
+    if (tables.n !== 2) return false;
+    return !!store.db.prepare(`
+      SELECT 1 FROM observations o
+      JOIN self_sync_map m ON m.kind = 'observation' AND m.row_id = o.id
+      JOIN self_sync_config c ON c.singleton = 1
+      WHERE o.id = ? AND c.enabled = 1 AND c.protocol = ?
+        AND m.owner = c.device AND o.origin_device_id = m.owner
+        AND o.origin_local_id = m.local
+    `).get(id, PRIVATE_SYNC_PROTOCOL);
   }
 
   private handleGetStats = this.wrapHandler((req: Request, res: Response): void => {

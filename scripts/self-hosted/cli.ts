@@ -19,7 +19,7 @@ function output(value: unknown) { process.stdout.write(JSON.stringify(value, nul
 
 async function main() {
   if (!command || command === 'help') {
-    process.stdout.write(`Self-hosted sync (manual; no schedule enabled)\n\n  baseline --database COPY.db --output baseline.json\n  reconcile --database COPY.db --manifest baseline.json\n  recover-config --database COPY.db --worker http://127.0.0.1:37777 --config recovered.json\n  setup --worker http://127.0.0.1:37777 --config local.json (--manifest baseline.json | --independent) [--work-aliases aliases.json]\n  attach --config local.json --ssh user@host --port 37778 --remote-token-file remote.json\n  status --config local.json\n  sync --config local.json [--pages 1000]\n  disable|enable --config local.json\n  inspect --config local.json --entity KIND:HASH\n  resolve --config local.json --entity KIND:HASH --chosen REVISION_HASH\n  inspect-work --config local.json --project NAME --list NAME\n\nSetup requires CLAUDE_MEM_SELF_HOSTED_SYNC_ALLOW_SETUP=1 on the loopback worker.\nFor the receiver run setup locally over SSH; copy its private config using scp.\nBaseline/reconcile open the explicit database READ ONLY and never migrate it.\n`); return;
+    process.stdout.write(`Self-hosted sync (manual; no schedule enabled)\n\n  baseline --database COPY.db --output baseline.json\n  reconcile --database COPY.db --manifest baseline.json\n  recover-config --database COPY.db --worker http://127.0.0.1:37777 --config recovered.json\n  setup --worker http://127.0.0.1:37777 --config local.json (--manifest baseline.json | --independent) [--work-aliases aliases.json] [--bootstrap-plan reviewed.json]\n  attach --config local.json --ssh user@host --port 37778 --remote-token-file remote.json\n  status --config local.json\n  sync --config local.json [--pages 1000]\n  disable|enable --config local.json\n  inspect --config local.json --entity KIND:HASH\n  resolve --config local.json --entity KIND:HASH --chosen REVISION_HASH\n  inspect-work --config local.json --project NAME --list NAME\n\nSetup requires CLAUDE_MEM_SELF_HOSTED_SYNC_ALLOW_SETUP=1 on the loopback worker.\nFor the receiver run setup locally over SSH; copy its private config using scp.\nBaseline/reconcile open the explicit database READ ONLY and never migrate it.\n`); return;
   }
   if (command === 'recover-config') {
     const database = option('database'), worker = option('worker'), path = option('config'); noExtras();
@@ -43,10 +43,10 @@ async function main() {
   }
   const path = option('config'); if (!path) throw new Error('--config is required');
   if (command === 'setup') {
-    const worker = option('worker'), manifest = option('manifest'), aliases = option('work-aliases'), independent = flag('independent'); noExtras();
-    if (!worker || Boolean(manifest) === independent) throw new Error('worker and exactly one of manifest/independent are required');
+    const worker = option('worker'), manifest = option('manifest'), aliases = option('work-aliases'), bootstrap = option('bootstrap-plan'), independent = flag('independent'); noExtras();
+    if (!worker || Boolean(manifest) === independent || (bootstrap && !manifest)) throw new Error('worker and exactly one of manifest/independent are required');
     if (existsSync(resolve(path))) throw new Error('config already exists; preserve its identity');
-    const body = { ...(manifest ? { baseline: JSON.parse(readFileSync(safePath(manifest), 'utf8')) } : { independent: true }), ...(aliases ? { workProjectAliases: JSON.parse(readFileSync(safePath(aliases), 'utf8')) } : {}) };
+    const body = { ...(manifest ? { baseline: JSON.parse(readFileSync(safePath(manifest), 'utf8')) } : { independent: true }), ...(bootstrap ? { bootstrapPlan: JSON.parse(readFileSync(safePath(bootstrap), 'utf8')) } : {}), ...(aliases ? { workProjectAliases: JSON.parse(readFileSync(safePath(aliases), 'utf8')) } : {}) };
     const result = await workerRequest({ worker, token: '' }, 'setup', body) as { token: string; device: string; epoch: string };
     save(path, { version: 1, worker: loopbackWorker(worker), token: result.token }); output({ configured: true, device: result.device, epoch: result.epoch }); return;
   }
