@@ -3,6 +3,7 @@ import express from 'express';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { type Server } from 'node:http';
 import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
 import { SessionSearch } from '../../../src/services/sqlite/SessionSearch.js';
@@ -10,6 +11,8 @@ import { SelfHostedSync } from '../../../src/services/sync/self-hosted/SelfHoste
 import { SelfHostedSyncRoutes } from '../../../src/services/worker/http/routes/SelfHostedSyncRoutes.js';
 import type { DatabaseManager } from '../../../src/services/worker/DatabaseManager.js';
 import { sshRequest, loopbackWorker, workerRequest } from '../../../src/services/sync/self-hosted/transport.js';
+import { createMiddleware } from '../../../src/services/worker/http/middleware.js';
+import { PROTOCOL, MAX_PACKET_BYTES, MAX_BASELINE_BYTES, MAX_ACCEPT_BYTES } from '../../../src/services/sync/self-hosted/protocol.js';
 import { parsePacket } from '../../../src/services/sync/self-hosted/protocol.js';
 import { logger } from '../../../src/utils/logger.js';
 
@@ -19,9 +22,10 @@ async function worker(directory: string, label: string, host = '127.0.0.1') {
   const store = new SessionStore(join(directory, `${label}.db`), { syncOpsEnabled: false }); new SessionSearch(store.db); cleanup.push(() => store.close());
   const sync = new SelfHostedSync(store.db);
   const manager = { getSelfHostedSync: () => sync, getCloudSync: () => null } as unknown as DatabaseManager;
-  const app = express(); app.use(express.json({ limit: '16mb' }));
+  const app = express(); app.use(createMiddleware());
+  app.post('/ordinary-json', (_req, res) => res.json({ ok: true }));
   new SelfHostedSyncRoutes(manager, { allowSetup: true, host: () => host }).setupRoutes(app);
-  app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(400).json({ error: error.name }));
+  app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status((error as { status?: number }).status ?? 400).json({ error: error.name }));
   const server = await new Promise<Server>(resolveServer => { const server = app.listen(0, '127.0.0.1', () => resolveServer(server)); }); cleanup.push(() => server.close());
   const port = (server.address() as { port: number }).port;
   return { store, sync, url: `http://127.0.0.1:${port}`, port };
@@ -33,17 +37,74 @@ async function cli(directory: string, ...args: string[]) {
 }
 
 describe('self-hosted worker routes and manual CLI', () => {
+  it('uses real production middleware for a corpus baseline above 5 MB and bounded parser errors', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cmem-sync-bodies-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const a = await worker(dir, 'a');
+    const baseline = { protocol: PROTOCOL, namespace: randomUUID(), schema: a.sync.schema(), rows: Array.from({ length: 65000 }, (_, i) => ({ kind: 'observation', local: String(i + 1), hash: 'x'.repeat(43) })) };
+    expect(Buffer.byteLength(JSON.stringify(baseline))).toBeGreaterThan(5 * 1024 * 1024);
+    const setup = await workerRequest({ worker: a.url, token: '' }, 'setup', { baseline }) as { token: string };
+    const connection = { worker: a.url, token: setup.token };
+    expect(await workerRequest(connection, 'reconcile', baseline)).toEqual({ matched: 0, independent: 0, ambiguous: [] });
+    const headers = { 'content-type': 'application/json', authorization: `Bearer ${setup.token}` };
+    const post = (route: string, body: string, extra: Record<string, string> = {}) => fetch(`${a.url}${route}`, { method: 'POST', headers: { ...headers, ...extra }, body });
+    const small = JSON.stringify({ ...baseline, rows: [] });
+    // The transport boundary counts raw UTF-8 bytes, including whitespace.
+    expect((await post('/api/self-hosted-sync/reconcile', small.padEnd(MAX_BASELINE_BYTES, ' '))).status).toBe(200);
+    const oversized = await post('/api/self-hosted-sync/reconcile', small.padEnd(MAX_BASELINE_BYTES + 1, ' '));
+    expect(oversized.status).toBe(413); expect(await oversized.json()).toEqual({ error: 'invalid private sync request' });
+    const malformed = await post('/api/self-hosted-sync/exchange', '{"private-memory-secret":');
+    expect(malformed.status).toBe(400); expect(await malformed.text()).not.toContain('private-memory-secret');
+    expect((await post('/api/self-hosted-sync/exchange', '{}'.padEnd(MAX_PACKET_BYTES + 1, ' '))).status).toBe(413);
+    expect((await post('/api/self-hosted-sync/accept', '{}'.padEnd(MAX_ACCEPT_BYTES + 1, ' '))).status).toBe(413);
+    expect((await post('/ordinary-json', '{}'.padEnd(5 * 1024 * 1024 + 1, ' '))).status).toBe(413);
+    // Reject unauthorized/browser callers before touching their large/malformed body.
+    expect((await post('/api/self-hosted-sync/exchange', 'malformed', { authorization: 'Bearer wrong' })).status).toBe(401);
+    expect((await post('/api/self-hosted-sync/exchange', 'malformed', { origin: 'https://evil.example' })).status).toBe(403);
+    expect((await post('/api/self-hosted-sync/exchange', '{}', { 'content-encoding': 'gzip' })).status).toBe(415);
+  }, 30000);
+
+  it('transfers valid large 24-revision pages and the double-packet accept envelope through production middleware', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cmem-sync-large-page-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const a = await worker(dir, 'a'), b = await worker(dir, 'b');
+    const ac = { worker: a.url, token: a.sync.setup({ independent: true }).token };
+    const bc = { worker: b.url, token: b.sync.setup({ independent: true }).token };
+    for (const [label, d] of [['a', a], ['b', b]] as const) {
+      const t = '2026-10-12T00:00:00.000Z';
+      d.store.db.query(`INSERT INTO sdk_sessions(content_session_id,memory_session_id,project,platform_source,started_at,started_at_epoch,status) VALUES(?,?,'project','claude-code',?,1,'completed')`).run(label, label, t);
+      const insert = d.store.db.query(`INSERT INTO observations(memory_session_id,project,type,title,narrative,created_at,created_at_epoch) VALUES(?,'project','discovery',?,?,?,1)`);
+      for (let i = 0; i < 24; i++) insert.run(label, `${label}-${i}`, 'm'.repeat(230000), t);
+    }
+    const request = parsePacket(await workerRequest(ac, 'prepare', {}));
+    expect(request.changes).toHaveLength(24);
+    expect(Buffer.byteLength(JSON.stringify(request))).toBeGreaterThan(5 * 1024 * 1024);
+    const response = parsePacket(await workerRequest(bc, 'exchange', request));
+    expect(response.changes).toHaveLength(24);
+    expect(Buffer.byteLength(JSON.stringify({ request, response }))).toBeGreaterThan(MAX_PACKET_BYTES);
+    expect(await workerRequest(ac, 'accept', { request, response })).toMatchObject({ conflicts: [], projectionErrors: [] });
+    for (let i = 0; i < 5; i++) {
+      const req = parsePacket(await workerRequest(ac, 'prepare', { peer: b.sync.status().device }));
+      const res = parsePacket(await workerRequest(bc, 'exchange', req));
+      await workerRequest(ac, 'accept', { request: req, response: res });
+    }
+    for (const d of [a, b]) {
+      expect(d.store.db.query('SELECT COUNT(*) AS n FROM observations').get()).toEqual({ n: 48 });
+      expect(d.sync.status().conflicts).toEqual([]);
+    }
+  }, 30000);
+
   it('runs two disposable workers through the real CLI and SSH-command path, retries offline, and remains a no-op on replay', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cmem-private-sync-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
     // Simulate SSH's remote exec only: execute the fixed remote curl command.
     // This exercises actual HTTP and CLI without connecting to a user's VPS.
     writeFileSync(join(dir, 'ssh'), '#!/bin/sh\nfor arg do command="$arg"; done\nexec /bin/sh -c "$command"\n', { mode: 0o700 });
     const a = await worker(dir, 'a'), b = await worker(dir, 'b');
+    a.store.appendWorkStateEntry({ project: 'legacy-project', listName: 'tasks', fields: { task: 'mac', status: 'todo' } });
     a.store.appendWorkStateEntry({ project: 'project', listName: 'tasks', fields: { task: 'mac', status: 'doing' } });
     b.store.appendWorkStateEntry({ project: 'project', listName: 'tasks', fields: { task: 'vps', status: 'done' } });
     const ac = join(dir, 'a.json'), bc = join(dir, 'b.json');
-    expect((await cli(dir, 'setup', '--worker', a.url, '--config', ac, '--independent')).code).toBe(0);
-    expect((await cli(dir, 'setup', '--worker', b.url, '--config', bc, '--independent')).code).toBe(0);
+    const aliases = join(dir, 'aliases.json'); writeFileSync(aliases, JSON.stringify([['legacy-project', 'project']]), { mode: 0o600 });
+    expect((await cli(dir, 'setup', '--worker', a.url, '--config', ac, '--independent', '--work-aliases', aliases)).code).toBe(0);
+    expect((await cli(dir, 'setup', '--worker', b.url, '--config', bc, '--independent', '--work-aliases', aliases)).code).toBe(0);
     expect((await cli(dir, 'attach', '--config', ac, '--ssh', 'fixture@localhost', '--port', String(b.port), '--remote-token-file', bc)).code).toBe(0);
     const synced = await cli(dir, 'sync', '--config', ac); expect(synced.stderr).toBe(''); expect(synced.code).toBe(0);
     expect(a.store.getWorkStateEntries(['project'], 'tasks')).toHaveLength(2); expect(b.store.getWorkStateEntries(['project'], 'tasks')).toHaveLength(2);

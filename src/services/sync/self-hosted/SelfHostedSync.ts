@@ -8,9 +8,9 @@ import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url } from '../CanonicalContent.js';
 import { SyncApply, type ChromaSyncLike, type SyncOp } from '../SyncApply.js';
 import { emitContextInvalidation } from '../../../shared/context-invalidation.js';
-import { TABLES, PAGE_SIZE, PROTOCOL, entityId, revision, parsePacket, portablePayload, nativePayload, SESSION_FIELDS, type Kind, type Revision, type Packet } from './protocol.js';
+import { TABLES, PAGE_SIZE, MAX_PACKET_BYTES, MAX_BASELINE_BYTES, PROTOCOL, entityId, revision, parsePacket, portablePayload, nativePayload, SESSION_FIELDS, type Kind, type Revision, type Packet } from './protocol.js';
 
-export interface Baseline { protocol: 1; namespace: string; schema: number; rows: Array<{ kind: Kind; local: string; hash: string }> }
+export interface Baseline { protocol: typeof PROTOCOL; namespace: string; schema: number; rows: Array<{ kind: Kind; local: string; hash: string }> }
 interface Mapping { entity: string; kind: Kind; owner: string; local: string; row_id: number | null; snapshot: string }
 interface Config { device: string; epoch: string; enabled: number; auth_token: string; protocol: number }
 interface Peer { device: string; epoch: string; received: number; sent: number }
@@ -53,6 +53,7 @@ export class SelfHostedSync {
       CREATE TABLE IF NOT EXISTS self_sync_errors(entity TEXT PRIMARY KEY, reason TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS self_sync_jobs(id TEXT PRIMARY KEY, seq INTEGER NOT NULL, row_id INTEGER NOT NULL, op TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS self_sync_work_projection(scope TEXT PRIMARY KEY, project TEXT NOT NULL, list_name TEXT NOT NULL, fields TEXT NOT NULL, created_at_epoch INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS self_sync_work_aliases(project TEXT PRIMARY KEY, canonical TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS self_sync_work_conflicts(scope TEXT NOT NULL, field TEXT NOT NULL, revisions TEXT NOT NULL, PRIMARY KEY(scope,field));
     `);
   }
@@ -61,7 +62,9 @@ export class SelfHostedSync {
     return this.db.query(`SELECT * FROM ${TABLES[kind]} ORDER BY id`).all() as Array<Record<string, unknown> & { id: number }>;
   }
   baseline(): Baseline {
-    return { protocol: PROTOCOL, namespace: randomUUID(), schema: this.schema(), rows: KINDS.flatMap(kind => this.rows(kind).map(row => ({ kind, local: String(row.id), hash: hash(portablePayload(kind, row)) }))) };
+    const baseline: Baseline = { protocol: PROTOCOL, namespace: randomUUID(), schema: this.schema(), rows: KINDS.flatMap(kind => this.rows(kind).map(row => ({ kind, local: String(row.id), hash: hash(portablePayload(kind, row)) }))) };
+    this.validateBaseline(baseline);
+    return baseline;
   }
   reconcile(baseline: Baseline): { matched: number; independent: number; ambiguous: Array<{ kind: Kind; local: string }> } {
     this.validateBaseline(baseline);
@@ -79,6 +82,7 @@ export class SelfHostedSync {
     return { matched, independent, ambiguous };
   }
   private validateBaseline(baseline: Baseline): void {
+    if (Buffer.byteLength(JSON.stringify(baseline)) > MAX_BASELINE_BYTES) throw new Error('baseline manifest exceeds size limit');
     if (!baseline || baseline.protocol !== PROTOCOL || baseline.schema !== this.schema() || !/^[a-f0-9-]{36}$/.test(baseline.namespace) || !Array.isArray(baseline.rows) || baseline.rows.length > 2_000_000) throw new Error('incompatible baseline manifest');
     const seen = new Set<string>();
     for (const r of baseline.rows) {
@@ -86,7 +90,7 @@ export class SelfHostedSync {
       seen.add(`${r.kind}:${r.local}`);
     }
   }
-  setup(input: { independent?: boolean; baseline?: Baseline }): { device: string; epoch: string; token: string } {
+  setup(input: { independent?: boolean; baseline?: Baseline; workProjectAliases?: string[][] }): { device: string; epoch: string; token: string } {
     if (this.configured()) throw new Error('already configured; identity cannot be replaced');
     if (!input.independent && !input.baseline) throw new Error('choose verified shared baseline or explicitly independent history');
     if (input.baseline && this.reconcile(input.baseline).ambiguous.length) throw new Error('baseline has changed/colliding rows; reconcile them on disposable copies before setup');
@@ -109,11 +113,44 @@ export class SelfHostedSync {
           this.map(r.kind, row.id, input.baseline.namespace, r.local, hash(null));
         }
       }
+      this.configureWorkAliases(input.workProjectAliases ?? []);
+      this.assertUnambiguousWorkActivation();
       this.capture();
       return { device, epoch, token };
     }).immediate();
     emitContextInvalidation('all', 'SelfHostedSync.setup', 'removal');
     return result;
+  }
+  private configureWorkAliases(groups: string[][]): void {
+    if (!Array.isArray(groups) || groups.length > 256) throw new Error('invalid work project aliases');
+    for (const group of groups) {
+      if (!Array.isArray(group) || group.length < 2 || group.length > 256 || group.some(p => typeof p !== 'string' || !p || p.length > 4096)) throw new Error('invalid work project aliases');
+      const canonical = projectKey(group.at(-1));
+      for (const project of new Set(group.map(projectKey))) {
+        const previous = this.db.query('SELECT canonical FROM self_sync_work_aliases WHERE project=?').get(project) as { canonical: string } | undefined;
+        if (previous && previous.canonical !== canonical) throw new Error('overlapping work project aliases');
+        this.db.query('INSERT OR IGNORE INTO self_sync_work_aliases VALUES(?,?)').run(project, canonical);
+      }
+    }
+  }
+  private canonicalWorkProject(project: unknown): string {
+    const key = projectKey(project);
+    return (this.db.query('SELECT canonical FROM self_sync_work_aliases WHERE project=?').get(key) as { canonical: string } | undefined)?.canonical ?? key;
+  }
+  /** There is no durable native checkout-alias registry. Never guess a historical
+   * ordering when separately scoped histories may later be folded by its reader. */
+  private assertUnambiguousWorkActivation(): void {
+    const writes = new Map<string, Set<string>>();
+    for (const row of this.rows('work')) {
+      const p = portablePayload('work', row), fields = p.fields as Record<string, unknown>;
+      const task = fields.task == null || fields.task === '' ? null : String(fields.task);
+      for (const key of Object.keys(fields).filter(k => k !== 'task')) {
+        const target = canonicalJson([p.list_name, task, key]);
+        const projects = writes.get(target) ?? new Set<string>();
+        projects.add(this.canonicalWorkProject(p.project)); writes.set(target, projects);
+        if (projects.size > 1) throw new Error('ambiguous work project aliases; review explicit workProjectAliases on disposable copies before setup');
+      }
+    }
   }
   setEnabled(enabled: boolean): void {
     if (!this.config()) throw new Error('not configured');
@@ -131,7 +168,7 @@ export class SelfHostedSync {
     const row = this.db.query('SELECT body FROM self_sync_log WHERE id=?').get(id) as { body: string } | undefined;
     return row ? JSON.parse(row.body) : undefined;
   }
-  private workScope(r: Revision): string { const p = r.payload!; return canonicalJson([projectKey(p.project), p.list_name]); }
+  private workScope(r: Revision): string { const p = r.payload!; return canonicalJson([p.scope_project, p.list_name]); }
   private workFrontier(scope: string): string[] {
     const events = this.workEvents().filter(r => this.workScope(r) === scope);
     const causes = new Set(events.flatMap(r => r.causes));
@@ -141,6 +178,7 @@ export class SelfHostedSync {
   capture(): void {
     const { device } = this.requireConfig();
     this.db.transaction(() => {
+      this.assertUnambiguousWorkActivation();
       for (const kind of KINDS) {
         const existing = this.db.query('SELECT * FROM self_sync_map WHERE kind=?').all(kind) as Mapping[];
         const byRow = new Map(existing.filter(r => r.row_id !== null).map(r => [r.row_id!, r]));
@@ -159,10 +197,11 @@ export class SelfHostedSync {
             m = this.map(kind, row.id, owner, local, hash(null));
           }
           const payload = portablePayload(kind, row);
+          if (kind === 'work') payload.scope_project = this.canonicalWorkProject(payload.project);
           const snapshot = hash(payload);
           if (snapshot === m.snapshot) continue;
           if (kind === 'work' && m.snapshot !== hash(null)) throw new Error('append-only work event was modified; repair on a disposable copy');
-          const causes = kind === 'work' ? this.workFrontier(canonicalJson([projectKey(payload.project), payload.list_name])) : [];
+          const causes = kind === 'work' ? this.workFrontier(canonicalJson([payload.scope_project, payload.list_name])) : [];
           const parents = kind === 'work' ? [] : this.heads(m.entity);
           const op = revision({ entity: m.entity, kind, owner: m.owner, local: m.local, actor: m.snapshot === hash(null) && !parents.length ? m.owner : device, parents, causes, payload, deleted: false });
           this.append(op);
@@ -183,6 +222,7 @@ export class SelfHostedSync {
   }
   private append(op: Revision): boolean {
     if (this.getRevision(op.id)) return false;
+    if (op.kind === 'work' && op.payload!.scope_project !== this.canonicalWorkProject(op.payload!.project)) throw new Error('work project alias plan mismatch; review matching plans on both devices');
     for (const id of op.parents) {
       const parent = this.getRevision(id);
       if (!parent || parent.entity !== op.entity) throw new Error('missing or foreign entity predecessor');
@@ -199,7 +239,16 @@ export class SelfHostedSync {
   private peer(device: string): Peer | undefined { return this.db.query('SELECT * FROM self_sync_peers WHERE device=?').get(device) as Peer | undefined; }
   head(): number { return (this.db.query('SELECT COALESCE(MAX(seq),0) AS head FROM self_sync_log').get() as { head: number }).head; }
   private page(after: number): Array<{ seq: number; revision: Revision }> {
-    return (this.db.query('SELECT seq,id,body FROM self_sync_log WHERE seq>? ORDER BY seq LIMIT ?').all(after, PAGE_SIZE) as Stored[]).map(r => ({ seq: r.seq, revision: JSON.parse(r.body) }));
+    const changes: Packet['changes'] = [];
+    // Reserve envelope space and stop before exceeding the wire byte bound.
+    let bytes = 1024;
+    for (const row of this.db.query('SELECT seq,id,body FROM self_sync_log WHERE seq>? ORDER BY seq LIMIT ?').all(after, PAGE_SIZE) as Stored[]) {
+      const change = { seq: row.seq, revision: JSON.parse(row.body) };
+      const size = Buffer.byteLength(JSON.stringify(change)) + 1;
+      if (bytes + size > MAX_PACKET_BYTES) break;
+      changes.push(change); bytes += size;
+    }
+    return changes;
   }
   prepare(peerDevice?: string): Packet {
     this.requireConfig();
@@ -268,6 +317,7 @@ export class SelfHostedSync {
         this.project(op);
       }
     }
+    this.assertUnambiguousWorkActivation();
     this.rebuildWorkProjection();
     // Session tombstones may precede their content tombstones in the page.
     // A constraint conflict is retained, then retried once dependencies clear.
@@ -287,6 +337,42 @@ export class SelfHostedSync {
   private queueIndex(r: Revision, id: number): void {
     const seq = (this.db.query('SELECT seq FROM self_sync_log WHERE id=?').get(r.id) as { seq: number }).seq;
     this.db.query('INSERT OR IGNORE INTO self_sync_jobs(id,seq,row_id,op) VALUES(?,?,?,?)').run(r.id, seq, id, canonicalJson(this.op(r)));
+  }
+  private sessionDependents(id: number): Array<{ mapping: Mapping; snapshot: string }> {
+    const rows = this.db.query(`SELECT m.* FROM self_sync_map m WHERE
+      (m.kind='prompt' AND m.row_id IN (SELECT id FROM user_prompts WHERE session_db_id=?))
+      OR (m.kind='observation' AND m.row_id IN (SELECT o.id FROM observations o JOIN sdk_sessions s ON s.memory_session_id=o.memory_session_id WHERE s.id=?))
+      OR (m.kind='summary' AND m.row_id IN (SELECT o.id FROM session_summaries o JOIN sdk_sessions s ON s.memory_session_id=o.memory_session_id WHERE s.id=?))`).all(id, id, id) as Mapping[];
+    return rows.map(mapping => ({ mapping, snapshot: hash(this.rowPayload(mapping)) }));
+  }
+  private rowPayload(m: Mapping): Record<string, unknown> {
+    const row = m.kind === 'prompt'
+      ? this.db.query(`SELECT p.*, s.memory_session_id, COALESCE(s.project,'unknown') AS project, COALESCE(s.platform_source,'claude-code') AS platform_source FROM user_prompts p LEFT JOIN sdk_sessions s ON p.session_db_id=s.id WHERE p.id=?`).get(m.row_id!)
+      : this.db.query(`SELECT * FROM ${TABLES[m.kind]} WHERE id=?`).get(m.row_id!);
+    if (!row) throw new Error('projection dependent disappeared');
+    return portablePayload(m.kind, row as Record<string, unknown>);
+  }
+  private recordProjectionEffects(source: Revision, dependents: Array<{ mapping: Mapping; snapshot: string }>): void {
+    for (const { mapping: m, snapshot: before } of dependents) {
+      const payload = this.rowPayload(m), snapshot = hash(payload);
+      if (snapshot === before) continue;
+      // capture() has already journaled genuine local edits under the same
+      // immediate transaction. Only changes caused by this SQL projection are
+      // acknowledged here; no content revision is invented on the receiver.
+      this.db.query('UPDATE self_sync_map SET snapshot=? WHERE entity=?').run(snapshot, m.entity);
+      const op: SyncOp = { seq: '1', kind: m.kind as SyncOp['kind'], origin_device: m.owner, origin_id: m.local, rev: '1', body: canonicalJson(nativePayload(payload)), server_ts: 0, deleted: false };
+      const seq = (this.db.query('SELECT seq FROM self_sync_log WHERE id=?').get(source.id) as { seq: number }).seq;
+      this.db.query('INSERT OR IGNORE INTO self_sync_jobs(id,seq,row_id,op) VALUES(?,?,?,?)').run(hash([source.id, m.entity]), seq, m.row_id, canonicalJson(op));
+    }
+  }
+  private contentSessionSnapshot(r: Revision): string {
+    const p = r.payload!;
+    // Native content apply can create/adopt/merge stubs. In this lane portable
+    // session revisions carry that authority; content must not mutate sessions
+    // or silently fold their independent identities. Include both lookup keys.
+    const sessions = this.db.query('SELECT * FROM sdk_sessions WHERE memory_session_id=? OR content_session_id=? ORDER BY id')
+      .all(bind(p.memory_session_id), bind(p.content_session_id)) as Array<Record<string, unknown>>;
+    return hash(sessions.map(row => [row.id, portablePayload('session', row)]));
   }
   private project(r: Revision): void {
     let m = this.db.query('SELECT * FROM self_sync_map WHERE entity=?').get(r.entity) as Mapping | undefined;
@@ -317,7 +403,9 @@ export class SelfHostedSync {
           const columns = [...SESSION_FIELDS, 'status'];
           id = Number(this.db.query(`INSERT INTO sdk_sessions(${columns.join(',')}) VALUES(${columns.map(() => '?').join(',')})`).run(...SESSION_FIELDS.map(k => bind(p[k])), 'completed').lastInsertRowid);
         } else {
+          const dependents = this.sessionDependents(id);
           this.db.query(`UPDATE sdk_sessions SET ${SESSION_FIELDS.map(k => `${k}=?`).join(',')} WHERE id=?`).run(...SESSION_FIELDS.map(k => bind(p[k])), id);
+          this.recordProjectionEffects(r, dependents);
         }
       } else if (r.kind === 'work') {
         const p = nativePayload(r.payload!);
@@ -330,8 +418,11 @@ export class SelfHostedSync {
               AND json_extract(prior.body,'$.payload.memory_session_id')=?) LIMIT 1`).get(bind(r.payload.memory_session_id));
           if (missingSession) throw new Error('tombstoned session identity collision; resolve the session explicitly');
         }
+        const sessionsBefore = r.deleted ? null : this.contentSessionSnapshot(r);
         id = this.nativeApplier().applySelfHostedRow(this.op(r));
+        if (!r.deleted && this.contentSessionSnapshot(r) !== sessionsBefore) throw new Error('content/session association identity collision; await authoritative portable session metadata');
         if (id !== null) {
+          if (!r.deleted && hash(this.rowPayload({ ...m, row_id: id })) !== hash(r.payload)) throw new Error('content/session association identity collision; portable projection differs from its revision');
           this.queueIndex(r, id);
         }
       }
@@ -371,7 +462,7 @@ export class SelfHostedSync {
       memo.set(r.id, result); return result;
     };
     const groups = new Map<string, Revision[]>();
-    for (const e of events) { const p = e.payload!, f = p.fields as Record<string, unknown>; const task = f.task === undefined || f.task === null || f.task === '' ? null : String(f.task); const key = canonicalJson([projectKey(p.project), p.list_name, task]); groups.set(key, [...groups.get(key) ?? [], e]); }
+    for (const e of events) { const p = e.payload!, f = p.fields as Record<string, unknown>; const task = f.task === undefined || f.task === null || f.task === '' ? null : String(f.task); const key = canonicalJson([p.scope_project, p.list_name, task]); groups.set(key, [...groups.get(key) ?? [], e]); }
     this.db.query('DELETE FROM self_sync_work_projection').run();
     this.db.query('DELETE FROM self_sync_work_conflicts').run();
     for (const [scope, group] of groups) {
@@ -387,7 +478,7 @@ export class SelfHostedSync {
         fields[key] = values.size > 1 ? `SYNC_CONFLICT (${live.length} concurrent values; inspect self-hosted sync status)` : (live[0].payload!.fields as Record<string, unknown>)[key];
       }
       const p = group[0].payload!;
-      this.db.query('INSERT INTO self_sync_work_projection VALUES(?,?,?,?,?)').run(scope, bind(p.project), bind(p.list_name), canonicalJson(fields), Math.max(...group.map(e => Number(e.payload!.created_at_epoch))));
+      this.db.query('INSERT INTO self_sync_work_projection VALUES(?,?,?,?,?)').run(scope, bind(p.scope_project), bind(p.list_name), canonicalJson(fields), Math.max(...group.map(e => Number(e.payload!.created_at_epoch))));
     }
   }
   status(): Record<string, unknown> {
@@ -401,7 +492,7 @@ export class SelfHostedSync {
   }
   /** Values never printed by status; explicit conflict inspection requires local authorization. */
   inspect(entity: string): Revision[] { return this.heads(entity).map(id => this.getRevision(id)!); }
-  inspectWork(project: string, list: string): Revision[] { return this.workEvents().filter(e => this.workScope(e) === canonicalJson([projectKey(project), list])); }
+  inspectWork(project: string, list: string): Revision[] { return this.workEvents().filter(e => this.workScope(e) === canonicalJson([this.canonicalWorkProject(project), list])); }
   async flushIndexJobs(): Promise<void> {
     if (!this.configured()) return;
     if (this.flushing) return this.flushing;
