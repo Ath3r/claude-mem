@@ -421,6 +421,17 @@ export class SelfHostedSync {
       .all(bind(p.memory_session_id), bind(p.content_session_id)) as Array<Record<string, unknown>>;
     return hash(sessions.map(row => [row.id, portablePayload('session', row)]));
   }
+  private hasDeletedSession(memorySessionId: string): boolean {
+    // CASE is intentionally lazy. An AND/EXISTS predicate can be reordered by
+    // SQLite to scan all retained history for every live session before it
+    // checks the head's deletion flag, blocking large-corpus ingestion.
+    return Boolean(this.db.query(`SELECT 1 FROM self_sync_map m
+      JOIN self_sync_heads h ON h.entity=m.entity JOIN self_sync_log l ON l.id=h.id
+      WHERE m.kind='session' AND CASE WHEN json_extract(l.body,'$.deleted')=1 THEN EXISTS(
+        SELECT 1 FROM self_sync_log prior WHERE json_extract(prior.body,'$.kind')='session'
+        AND json_extract(prior.body,'$.entity')=m.entity
+        AND json_extract(prior.body,'$.payload.memory_session_id')=?) ELSE 0 END LIMIT 1`).get(memorySessionId));
+  }
   private project(r: Revision): void {
     let m = this.db.query('SELECT * FROM self_sync_map WHERE entity=?').get(r.entity) as Mapping | undefined;
     if (!m) m = this.map(r.kind, null, r.owner, r.local, hash(null));
@@ -458,13 +469,7 @@ export class SelfHostedSync {
         const p = nativePayload(r.payload!);
         id = Number(this.db.query('INSERT INTO work_state_entries(project,list_name,fields,created_at,created_at_epoch) VALUES(?,?,?,?,?)').run(bind(p.project), bind(p.list_name), bind(p.fields), bind(p.created_at), bind(p.created_at_epoch)).lastInsertRowid);
       } else {
-        if (!r.deleted && r.payload?.memory_session_id) {
-          const missingSession = this.db.query(`SELECT 1 FROM self_sync_map m JOIN self_sync_heads h ON h.entity=m.entity JOIN self_sync_log l ON l.id=h.id
-            WHERE m.kind='session' AND json_extract(l.body,'$.deleted')=1 AND EXISTS(
-              SELECT 1 FROM self_sync_log prior WHERE json_extract(prior.body,'$.entity')=m.entity
-              AND json_extract(prior.body,'$.payload.memory_session_id')=?) LIMIT 1`).get(bind(r.payload.memory_session_id));
-          if (missingSession) throw new Error('tombstoned session identity collision; resolve the session explicitly');
-        }
+        if (!r.deleted && r.payload?.memory_session_id && this.hasDeletedSession(String(r.payload.memory_session_id))) throw new Error('tombstoned session identity collision; resolve the session explicitly');
         const sessionsBefore = r.deleted ? null : this.contentSessionSnapshot(r);
         id = this.nativeApplier().applySelfHostedRow(this.op(r));
         if (!r.deleted && this.contentSessionSnapshot(r) !== sessionsBefore) throw new Error('content/session association identity collision; await authoritative portable session metadata');
