@@ -3,6 +3,7 @@
  * Base-table SQL and incoming checkpoints commit together; FTS triggers remain authoritative.
  */
 import { validateBootstrapPlan, type BootstrapPlan } from './bootstrap.js';
+import { validateSessionRemapPlan, type SessionRemapPlan } from './session-remap.js';
 import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import { randomUUID, randomBytes } from 'crypto';
 import { logger } from '../../../utils/logger.js';
@@ -116,16 +117,19 @@ export class SelfHostedSync {
       seen.add(`${r.kind}:${r.local}`);
     }
   }
-  setup(input: { independent?: boolean; baseline?: Baseline; bootstrapPlan?: BootstrapPlan; workProjectAliases?: string[][] }): { device: string; epoch: string; token: string } {
+  setup(input: { independent?: boolean; baseline?: Baseline; bootstrapPlan?: BootstrapPlan; sessionRemapPlan?: SessionRemapPlan; workProjectAliases?: string[][] }): { device: string; epoch: string; token: string } {
     if (this.configured()) throw new Error('already configured; identity cannot be replaced');
     if (!input.independent && !input.baseline) throw new Error('choose verified shared baseline or explicitly independent history');
-    if (input.bootstrapPlan && !input.baseline) throw new Error('bootstrap plan requires a shared baseline');
+    if ((input.bootstrapPlan || input.sessionRemapPlan) && !input.baseline) throw new Error('bootstrap plan requires a shared baseline');
     if (input.baseline && input.independent) throw new Error('choose exactly one history mode');
     const result = this.db.transaction(() => {
       const reviewed = input.bootstrapPlan ? validateBootstrapPlan(input.bootstrapPlan, input.baseline!, new Map(this.rows('session').map(row => [String(row.id), row]))) : new Map();
+      const remapped = input.sessionRemapPlan ? validateSessionRemapPlan(input.sessionRemapPlan, input.baseline!, new Map(KINDS.map(kind => [kind, this.rows(kind)]))) : new Map();
+      if (input.sessionRemapPlan && this.db.query('PRAGMA foreign_key_check').all().length) throw new Error('session remap requires valid foreign keys');
+      if ([...reviewed.keys()].some(local => remapped.has(`session:${local}`))) throw new Error('overlapping bootstrap plans');
       if (input.baseline) {
         const report = this.reconcile(input.baseline);
-        if (report.ambiguous.some(row => row.kind !== 'session' || !reviewed.has(row.local))) throw new Error('baseline has changed/colliding rows; reconcile them on disposable copies before setup');
+        if (report.ambiguous.some(row => !remapped.has(`${row.kind}:${row.local}`) && (row.kind !== 'session' || !reviewed.has(row.local)))) throw new Error('baseline has changed/colliding rows; reconcile them on disposable copies before setup');
         const localWork = new Set(this.rows('work').map(row => String(row.id)));
         if (input.baseline.rows.some(row => row.kind === 'work' && !localWork.has(row.local))) throw new Error('partial work baseline cannot establish shared causality; reconcile complete event history first');
       }
@@ -140,12 +144,12 @@ export class SelfHostedSync {
         for (const r of input.baseline.rows) {
           const row = byKind.get(r.kind)!.get(r.local);
           if (!row) continue;
-          const reviewedSession = r.kind === 'session' ? reviewed.get(r.local) : undefined;
-          const mapping = this.map(r.kind, row.id, input.baseline.namespace, r.local, reviewedSession ? r.hash : hash(null));
-          if (reviewedSession) {
+          const reviewedRow = remapped.get(`${r.kind}:${r.local}`) ?? (r.kind === 'session' ? reviewed.get(r.local) : undefined);
+          const mapping = this.map(r.kind, row.id, input.baseline.namespace, r.local, reviewedRow ? r.hash : hash(null));
+          if (reviewedRow) {
             // Same revision as an unchanged peer, then capture() journals the
-            // current completion as its causal child without rewriting the row.
-            this.append(revision({ entity: mapping.entity, kind: 'session', owner: mapping.owner, local: mapping.local, actor: mapping.owner, parents: [], causes: [], payload: reviewedSession.baselinePayload, deleted: false }));
+            // current payload as its causal child without rewriting the row.
+            this.append(revision({ entity: mapping.entity, kind: r.kind, owner: mapping.owner, local: mapping.local, actor: mapping.owner, parents: [], causes: [], payload: reviewedRow.baselinePayload, deleted: false }));
           }
         }
       }
