@@ -1,6 +1,6 @@
 # Self-hosted sync release candidate on upstream 13.37
 
-This is release preparation, with no main merge, live activation, installed-worker restart, configuration change, or scheduler. Draft [PR #6](https://github.com/Ath3r/claude-mem/pull/6) is stacked on [PR #5](https://github.com/Ath3r/claude-mem/pull/5); the parent owns both merge gates and subsequent rollout.
+This records historical release preparation, which performed no live activation, installed-worker restart, configuration change, or scheduling, for [PR #6](https://github.com/Ath3r/claude-mem/pull/6), originally stacked on [PR #5](https://github.com/Ath3r/claude-mem/pull/5). Both PRs are now merged; the parent still owns subsequent rollout gates. Later session-remap work has a [separate verification contract](audited-session-remap.md).
 
 ## Source and artifacts
 
@@ -32,7 +32,7 @@ The runtime's minimal dependency manifest is recorded alongside `source-package.
 
 ## Acceptance boundaries and rollout handoff
 
-Full actual-corpus Chroma completion remains unproven. A separate disposable full-corpus probe indexed 918 native embeddings from an empty index within a 180-second budget (184.990 seconds including its final semantic query), and that query passed. Historical backfill had not completed when the owned container was stopped. Zero private jobs did not mean complete historical embeddings; backfill is a separate native pipeline. The copied database/index and checkpoints remain private for continuation. No live installed capture/search/context, live auth generation, fresh production reconciliation, or production rollout is claimed. No full local test suite was run; integrated CI and PR5 final review remain parent-owned gates.
+Full actual-corpus Chroma completion remains unproven. A separate disposable full-corpus probe indexed 918 native embeddings from an empty index within a 180-second budget (184.990 seconds including its final semantic query), and that query passed. Historical backfill had not completed when the owned container was stopped. Zero private jobs did not mean complete historical embeddings; backfill is a separate native pipeline. The copied database/index and checkpoints remain private for continuation. No live installed capture/search/context, live auth generation, fresh production reconciliation, or production rollout is claimed. No full local test suite was run; integrated CI and PR5 final review were parent-owned gates at the time of this preparation.
 
 The corpus test resumed preserved initialized copies, so it is not a new complete bootstrap timing or fresh setup proof on the combined release. Full-copy setup and reconciliation must be repeated on fresh device-specific SQLite backups before live activation, including a newly hash-bound review plan if completion metadata changed. Never copy initialized identity/journals into another live device.
 
