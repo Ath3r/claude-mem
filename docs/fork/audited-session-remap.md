@@ -73,20 +73,26 @@ An exception on a reference-only parent is rejected. Completion-only
 `bootstrapPlan` is unchanged; other parents may have separate completion
 approvals, but approvals for the same parent cannot overlap.
 
-This source extension requires regenerated committed bundles, fresh typechecks
-and independently reviewed combined disposable acceptance before release. The
-previous sealed reference-only acceptance artifacts do not validate this source
-or the newer combined snapshot. Its active acceptance pipeline remains untouched.
+The approved combined source at `8a468692` has regenerated worker bundles and
+fresh root/viewer typechecks. Combined disposable acceptance remains a release
+gate. The previous sealed reference-only artifacts do not validate this source
+or the newer combined snapshot; those checkpoints remain retained unchanged.
 
 ## Verification contract
 
-Combined source-only regression check: 165 tests and 1,442 assertions passed
-across `self-hosted-session-remap.test.ts`, `self-hosted-bootstrap.test.ts` and
-`logger-usage-standards.test.ts`, using an isolated data directory. The logger
-reports only aggregate graph counts after successful validation. Build, bundle
-regeneration, root/viewer typechecks and fresh combined disposable acceptance
-remain pending the existing acceptance owner's exclusive heavy-resource slot.
-These focused results do not replace those gates or independent review.
+Fresh validation after regenerating the combined worker bundle: 193 tests and
+1,507 assertions passed across the two bootstrap/remap suites, logger standards,
+committed bundle checks and version consistency. Production build, root/viewer
+typechecks, hook-I/O and spawn-environment guards passed with an isolated data
+directory. The logger reports only aggregate graph counts. These checks do not
+prove newest-backup SSH convergence or historical native Chroma acceptance.
+
+The older reference-only run completed 111,878 records and 111,909 revisions
+with equal fingerprints, preserved receipts and two one-page no-ops. Its
+historical Chroma continuation stopped at 15,665 of 678,467 fragments with
+`attempt to write a readonly database`; the failing SQLite operation was not
+identified by that runner. Historical coverage, native query/context and deletion
+restart recovery remain unproven. This report does not authorize activation.
 
 Tests must prove all four kinds retain native content, ownership, FKs and root
 history; old-root-first and remap-first page exchange must converge without false
