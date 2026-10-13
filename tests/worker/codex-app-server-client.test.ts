@@ -3,6 +3,7 @@ import { getSupervisor } from '../../src/supervisor/index.js';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   buildCodexAppServerArgs,
   buildCodexAppServerEnv,
@@ -108,6 +109,136 @@ function readTrace(path: string): Array<Record<string, any>> {
   if (!existsSync(path)) return [];
   return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
+
+function legacyChatGptAuth() {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return {
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: `${encode({ alg: 'none' })}.${encode({
+        'https://api.openai.com/auth': { chatgpt_plan_type: 'plus', chatgpt_account_id: 'synthetic-account' },
+      })}.synthetic-signature`,
+      access_token: 'synthetic-access',
+      refresh_token: 'synthetic-refresh',
+      account_id: 'synthetic-account',
+    },
+  };
+}
+
+itPosix('accepts legacy ChatGPT tokens without rewriting native auth', async () => {
+  const fake = createFakeCodex();
+  const authPath = join(fake.authHome, 'auth.json');
+  const original = JSON.stringify(legacyChatGptAuth());
+  writeFileSync(authPath, original, { mode: 0o600 });
+  const client = new CodexAppServerClient({ nativeCodexHome: fake.authHome });
+  try {
+    const result = await client.runTurn({ codexPath: fake.executable, model: '', reasoningEffort: null,
+      prompt: 'Summarize.', timeoutMs: 5000 });
+    expect(result.content).toContain('<title>Turn 1</title>');
+    const scopedHome = readTrace(fake.trace).find(entry => entry.method === 'process/start')?.codexHome;
+    expect(readFileSync(join(scopedHome, 'auth.json'), 'utf8')).toBe(original);
+    expect(readFileSync(authPath, 'utf8')).toBe(original);
+  } finally {
+    await client.close();
+    rmSync(fake.root, { recursive: true, force: true });
+  }
+});
+
+itPosix('keeps explicit external ChatGPT token mode with an empty refresh token supported', async () => {
+  const fake = createFakeCodex();
+  const auth = { ...legacyChatGptAuth(), auth_mode: 'chatgptAuthTokens' };
+  auth.tokens.refresh_token = '';
+  writeFileSync(join(fake.authHome, 'auth.json'), JSON.stringify(auth), { mode: 0o600 });
+  const client = new CodexAppServerClient({ nativeCodexHome: fake.authHome });
+  try {
+    const result = await client.runTurn({ codexPath: fake.executable, model: '', reasoningEffort: null,
+      prompt: 'Summarize.', timeoutMs: 5000 });
+    expect(result.content).toContain('<title>Turn 1</title>');
+  } finally {
+    await client.close();
+    rmSync(fake.root, { recursive: true, force: true });
+  }
+});
+
+const invalidLegacyAuth: Array<[string, unknown]> = [
+  ['missing tokens', {}], ['null tokens', { tokens: null }], ['array tokens', { tokens: [] }],
+  ['empty tokens', { tokens: {} }], ['non-object auth', []],
+];
+for (const field of ['id_token', 'access_token', 'refresh_token']) {
+  for (const value of [undefined, null, 123, '', '   ']) {
+    invalidLegacyAuth.push([`${field} ${String(value)}`, {
+      ...legacyChatGptAuth(), tokens: { ...legacyChatGptAuth().tokens, [field]: value },
+    }]);
+  }
+}
+for (const mode of ['apikey', 'unknown', null]) {
+  invalidLegacyAuth.push([`explicit mode ${String(mode)}`, { ...legacyChatGptAuth(), auth_mode: mode }]);
+}
+for (const key of ['OPENAI_API_KEY', 'personal_access_token', 'bedrock_api_key', 'bedrock_access_keys']) {
+  invalidLegacyAuth.push([`alternate credential ${key}`, { ...legacyChatGptAuth(), [key]: 'synthetic-key' }]);
+}
+invalidLegacyAuth.push(['empty API key', { ...legacyChatGptAuth(), OPENAI_API_KEY: '' }]);
+invalidLegacyAuth.push(['invalid account id', {
+  ...legacyChatGptAuth(), tokens: { ...legacyChatGptAuth().tokens, account_id: 123 },
+}]);
+for (const [label, auth] of invalidLegacyAuth) {
+  it(`rejects malformed or non-ChatGPT legacy auth: ${label}`, async () => {
+    const fake = createFakeCodex();
+    writeFileSync(join(fake.authHome, 'auth.json'), JSON.stringify(auth), { mode: 0o600 });
+    const client = new CodexAppServerClient({ nativeCodexHome: fake.authHome });
+    try {
+      await expect(client.runTurn({ codexPath: fake.executable, model: '', reasoningEffort: null,
+        prompt: 'Summarize.', timeoutMs: 5000 })).rejects.toThrow('not an API key');
+      expect(readTrace(fake.trace)).toHaveLength(0);
+    } finally {
+      await client.close();
+      rmSync(fake.root, { recursive: true, force: true });
+    }
+  });
+}
+
+itPosix('still rejects shared permissions on legacy ChatGPT auth before launching Codex', async () => {
+  const fake = createFakeCodex();
+  const authPath = join(fake.authHome, 'auth.json');
+  writeFileSync(authPath, JSON.stringify(legacyChatGptAuth()), { mode: 0o600 });
+  chmodSync(authPath, 0o644);
+  const client = new CodexAppServerClient({ nativeCodexHome: fake.authHome });
+  try {
+    await expect(client.runTurn({ codexPath: fake.executable, model: '', reasoningEffort: null,
+      prompt: 'Summarize.', timeoutMs: 5000 })).rejects.toThrow('permissions must deny group and other access');
+    expect(readTrace(fake.trace)).toHaveLength(0);
+  } finally {
+    await client.close();
+    rmSync(fake.root, { recursive: true, force: true });
+  }
+});
+
+// Optional native consumer proof, with disposable synthetic credentials only.
+// No generation request, real auth file, or provider credentials are involved.
+const itNativeCodex = process.env.CLAUDE_MEM_TEST_CODEX_PATH && process.platform !== 'win32' ? it : it.skip;
+itNativeCodex('native Codex recognizes legacy auth linked into the private runtime', async () => {
+  const fake = createFakeCodex();
+  const authPath = join(fake.authHome, 'auth.json');
+  const original = JSON.stringify(legacyChatGptAuth());
+  writeFileSync(authPath, original, { mode: 0o600 });
+  const client = new CodexAppServerClient({ nativeCodexHome: fake.authHome });
+  try {
+    await client.runTurn({ codexPath: fake.executable, model: '', reasoningEffort: null,
+      prompt: 'Summarize.', timeoutMs: 5000 });
+    const scopedHome = readTrace(fake.trace).find(entry => entry.method === 'process/start')?.codexHome;
+    const status = spawnSync(process.env.CLAUDE_MEM_TEST_CODEX_PATH!,
+      ['-c', 'cli_auth_credentials_store="file"', 'login', 'status'], {
+        env: { CODEX_HOME: scopedHome, HOME: fake.root, PATH: process.env.PATH },
+        encoding: 'utf8', timeout: 15000,
+      });
+    expect(status.status).toBe(0);
+    expect(`${status.stdout}${status.stderr}`.includes('Logged in using ChatGPT')).toBe(true);
+    expect(readFileSync(authPath, 'utf8')).toBe(original);
+  } finally {
+    await client.close();
+    rmSync(fake.root, { recursive: true, force: true });
+  }
+});
 
 itPosix('leaves model and effort selection to Codex when no override is configured', async () => {
   const fake = createFakeCodex();

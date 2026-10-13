@@ -187,6 +187,23 @@ function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function hasChatGptAuth(auth: unknown): boolean {
+  if (!isObject(auth)) return false;
+  if (Object.hasOwn(auth, 'auth_mode')) {
+    return auth.auth_mode === 'chatgpt' || auth.auth_mode === 'chatgptAuthTokens';
+  }
+
+  // Native Codex also reads older token files without auth_mode. Other stored
+  // credentials take precedence in its inferred mode; never infer ChatGPT then.
+  if (['OPENAI_API_KEY', 'personal_access_token', 'bedrock_api_key', 'bedrock_access_keys']
+    .some(key => auth[key] != null)) return false;
+  const tokens = auth.tokens;
+  if (!isObject(tokens)) return false;
+  return ['id_token', 'access_token', 'refresh_token'].every(key =>
+    typeof tokens[key] === 'string' && tokens[key].trim().length > 0)
+    && (tokens.account_id == null || typeof tokens.account_id === 'string');
+}
+
 function asString(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error(`Codex app-server returned invalid ${label}`);
@@ -283,7 +300,7 @@ function createPrivateRuntime(nativeCodexHome: string): PrivateRuntime {
     } catch (error) {
       throw codexSetupError(`Cannot read Codex ChatGPT auth: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!isObject(auth) || (auth.auth_mode !== 'chatgpt' && auth.auth_mode !== 'chatgptAuthTokens')) {
+    if (!hasChatGptAuth(auth)) {
       throw codexSetupError('claude-mem requires Codex CLI to be logged in with ChatGPT, not an API key');
     }
 
