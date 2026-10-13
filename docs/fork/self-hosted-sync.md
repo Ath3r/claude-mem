@@ -21,6 +21,8 @@ For the existing migration, the baseline backup is `<backup-dir>/claude-mem.db.g
 
 ```sh
 # Run from this fork checkout. All paths below refer to disposable copies.
+# Set BEFORE importing any CLI/helper: logger/paths resolve this at module load.
+export CLAUDE_MEM_DATA_DIR=/private/path/isolated-tool-data
 bun scripts/self-hosted/cli.ts baseline --database /tmp/shared-baseline.db --output /tmp/shared-baseline.json
 bun scripts/self-hosted/cli.ts reconcile --database /tmp/mac-copy.db --manifest /tmp/shared-baseline.json
 bun scripts/self-hosted/cli.ts reconcile --database /tmp/vps-copy.db --manifest /tmp/shared-baseline.json
@@ -32,11 +34,19 @@ Read the counts:
 |---|---|
 | matched | Local ID and portable-content hash exactly match the shared baseline; adopt the shared identity. |
 | independent | Row ID lies outside the baseline; preserve it under this device's own identity. This includes VPS-native rows appended by the prior migration. |
-| ambiguous | A baseline row ID has different portable content. It may be an edit, a collision, or a different import. Setup refuses these; investigate on disposable copies rather than guessing attribution. |
+| ambiguous | A baseline row ID has different portable content. It may be an edit, a collision, or a different import. Setup refuses these unless an exact completion-only session bootstrap plan is reviewed; investigate on disposable copies rather than guessing attribution. |
 
-The first implementation requires matching IDs for baseline rows. It does not guess mappings for reordered imports, changed historical rows, or partially overlapping work-event sequences. Do not bypass an ambiguous report with `--independent`. Missing baseline rows are not inferred as deletions: absence before setup has no deletion authority.
+The implementation requires matching IDs for baseline rows. It does not guess mappings for reordered imports, general historical edits, or partially overlapping work-event sequences. Do not bypass an ambiguous report with `--independent`. Missing baseline rows are not inferred as deletions: absence before setup has no deletion authority.
 
 For two stores with truly independent histories, use `--independent` explicitly on each; equal local SQLite IDs are safe because each device gets a different UUID.
+
+### Reviewed session completion advances
+
+An original shared session can legitimately finish after the baseline snapshot. Never erase its completion, remove its manifest entry, or classify it as independent. `setup --bootstrap-plan /private/path/reviewed.json --manifest ...` accepts a bounded exception only for `completed_at` / `completed_at_epoch` advances. Other content, identities, work events, and naming rules remain unchanged. Legacy exactly empty project strings are preserved for portable sessions/content in the private lane; this does not relax Pro/public validation or work naming.
+
+The private plan is a strict JSON object with `protocol`, `namespace`, `schema`, `manifestHash`, and `sessions`. Each entry contains `local`, `expectedHash`, `currentHash`, `allowedFields`, `baselinePayload`, and a nonempty review `reason`. `manifestHash` is SHA-256/base64url of the canonical complete manifest. The two payload hashes use the same canonical hashing. `baselinePayload` must come from the immutable original copy and match that manifest entry. `allowedFields` must exactly enumerate the changed completion fields; new completion values must be a consistent advancing timestamp pair. Do not commit or print this plan: it contains private session metadata. Plans are limited to 256 sessions and 64 KiB.
+
+Review every differing field against immutable and current copies before creating the plan. Setup verifies the entire plan and current rows again inside one immediate SQLite transaction. Stale hashes, changed identity, unexpected fields, duplicate entries, unknown IDs and unreviewed differences fail closed. It journals the deterministic original shared revision, then a local causal child with the current completion; the base row is not rewritten. An unchanged peer's older baseline cannot overwrite that child. Distinct concurrent advances remain explicit conflicts.
 
 ### Review checkout aliases before setup
 
@@ -109,11 +119,11 @@ An identity/foreign-key collision or locally referenced session tombstone become
 
 ## Storage, indexes and recovery
 
-The opt-in extension uses `self_sync_*` tables rather than changing upstream schema versions. It scans portable base-table rows before each manual exchange, compares fingerprints against its mappings, and appends revisions for offline inserts/edits/deletes. This deliberately favors a small integration surface over per-write upstream triggers. A worker restart does not lose uncaptured local changes; a new exchange captures them. It costs a full portable-row scan per request, and work-state projection currently replays retained events. Large-corpus performance still needs measurement before scheduling frequent sync.
+The opt-in extension uses `self_sync_*` tables rather than changing upstream schema versions. New setups install SQLite triggers that increment a transactional change counter for portable inserts, updates and deletes from every connection. Before exchange, a dirty counter causes a portable-row scan, fingerprint comparison and revision capture. An unchanged counter skips the scan. Validated incoming projections acknowledge their own changes inside the same transaction; rollback also rolls back the counter. Work-journal selection uses a kind/sequence index instead of reparsing all content payloads. Older configured journals without the counter retain conservative full scans; this patch does not silently migrate them. A worker restart preserves uncaptured changes. Dirty scans still read the full portable corpus, and work-state projection still replays retained events; measure on each target before scheduling frequent sync.
 
 Received revisions, projections, replay identities and peer checkpoints commit in one SQLite transaction. Full immutable revision history is retained; there is no compaction/pruning yet, allowing long offline catch-up and explicit conflict inspection. Epoch/protocol/schema changes fail closed and need deliberate recovery rather than silently resetting cursors. SQLite restore must preserve the complete private journal and peer checkpoints; restore both original device identity and epoch only for that same device. A replacement device needs new setup/baseline review.
 
-Native `CanonicalContent` validates observation/summary/prompt payloads. Native `SyncApply` handles their local row/session mapping. Base-table writes activate SQLite FTS triggers. The worker emits in-process context invalidation only after commit, and persists index jobs in SQLite before Chroma forwarding. Failed forwarding stays pending and retries on the next exchange or worker startup; native Chroma also retains its existing pending reconciliation markers. Deletion jobs remove all Chroma fragments for that SQLite record. Content conflicts remain visible through status; resolving them schedules a fresh index projection.
+Native `CanonicalContent` validates observation/summary/prompt payloads. Native `SyncApply` handles their local row/session mapping. Base-table writes activate SQLite FTS triggers. The worker emits in-process context invalidation only after commit, and persists index jobs in SQLite before Chroma forwarding. Failed forwarding stays pending and retries on the next exchange or worker startup; native Chroma also retains its existing pending reconciliation markers. Deletion jobs remove all Chroma fragments for that SQLite record. Public observation DELETE permits an originally local private observation only when the enabled matching-protocol journal maps it to the current device and both stored origin fields agree. Peer-owned, shared-baseline-owned, Pro-imported and unproven origins remain denied. Normal capture appends the deletion tombstone before the next exchange; immutable prior revisions remain retained. Content conflicts remain visible through status; resolving them schedules a fresh index projection.
 
 Session updates can change joined prompt fields and cascade memory identifiers into observations and summaries. Their receiver-side fingerprints and index jobs update atomically with the session projection, so a later page does not mistake those SQL effects for new local edits. Genuine local edits are captured before applying incoming pages and remain distinct revisions. Native content application cannot implicitly create/adopt/merge session stubs or leave a portable row different from its revision; such projections remain explicit conflicts until authoritative session metadata makes the association safe.
 
@@ -124,3 +134,32 @@ Focused tests use disposable stores only. They cover two-way exchanges across al
 The HTTP tests use the production middleware, including a baseline above 5 MiB, valid large 24-revision pages, a two-packet accept body, exact byte limits, authentication before parsing, and sanitized parser errors. Alias regressions cover refused activation, reviewed shared history, completion before any exchange, mismatched plans, and concurrent reopening. A 24-session page regression covers joined prompts and observation/summary cascades without receiver-authored revisions, index scheduling, and preservation of a genuine edit between pages.
 
 The CLI smoke runs two disposable worker-route HTTP servers with real CLI subprocesses and curl. A temporary SSH shim simulates remote command execution; it does **not** prove real SSH authentication, host-key handling, the production worker lifecycle, installed plugin compatibility, live Chroma, or real Mac/VPS baseline attribution. Those remain required before live activation. No existing Mac/VPS store, service, plugin installation, or schedule was changed.
+
+### Parent-owned release and backup gate
+
+The compatibility branch is based on fork 13.35.0 and includes auth fix `a879d5490`. It is **not** an installable downgrade for a Mac running 13.37. Parent must integrate the reviewed compatibility commit and auth fix into its intended upstream release, verify both changes are present, pass that release's CI, and build that version before either live install. No upstream merge, installed-worker restart, scheduler, or live database change is part of this PR.
+
+Before rollout, on each device independently, take a SQLite backup under its own private directory. Substitute that device's verified live database and backup path; do not copy a running `.db` file without its WAL:
+
+```sh
+umask 077
+python3 - "$verified_live_db" "$new_private_backup_db" <<'PY'
+import pathlib, sqlite3, sys
+source, destination = map(pathlib.Path, sys.argv[1:])
+if not source.is_file() or destination.exists():
+    raise SystemExit('source missing or backup path already exists')
+src = sqlite3.connect(source.resolve().as_uri() + '?mode=ro', uri=True)
+dst = sqlite3.connect(destination)
+try:
+    src.backup(dst)
+    if dst.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+        raise SystemExit('backup integrity failed')
+finally:
+    dst.close()
+    src.close()
+PY
+```
+
+Retain the prior install/build, service command, settings and private configs separately for rollback. Run full reconciliation again against fresh consistent copies immediately before setup: the three-session plan from acceptance is bound to those copied contents and is not reusable if live hashes have advanced. Prepare a newly reviewed plan for any changed completion metadata; other changes still require investigation. Set `CLAUDE_MEM_DATA_DIR` before every helper/CLI launch. Setup has a bounded five-minute transport budget for large corpus initialization; if a response is lost, inspect/recover the existing identity rather than starting independent setup.
+
+After the parent deploys its version-preserving release, use the setup/attach commands above with the reviewed manifest and, only on the device needing it, `--bootstrap-plan`. Keep the setup flag window short. Run manual sync to completion, repeat to a no-op, verify native capture/search/context/deletion and the retained corpus/work fingerprints, then review measured dirty-scan and exchange costs before enabling any separately managed schedule. Preserve initialized device identities and complete journals in subsequent backups. If acceptance fails, disable private sync on both devices and restore only the affected device's verified backup/install through the parent's rollout procedure; never swap one initialized device database into the other.
