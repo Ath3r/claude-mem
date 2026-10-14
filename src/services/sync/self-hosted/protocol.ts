@@ -8,7 +8,7 @@ export const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 export const MAX_BASELINE_BYTES = 32 * 1024 * 1024;
 export const MAX_ACCEPT_BYTES = 2 * MAX_PACKET_BYTES + 1024;
 export const LARGE_SYNC_BODY_LIMITS: Readonly<Record<string, number>> = {
-  '/api/self-hosted-sync/setup': MAX_BASELINE_BYTES + 65536,
+  '/api/self-hosted-sync/setup': MAX_BASELINE_BYTES + MAX_PACKET_BYTES + 65536,
   '/api/self-hosted-sync/reconcile': MAX_BASELINE_BYTES,
   '/api/self-hosted-sync/exchange': MAX_PACKET_BYTES,
   '/api/self-hosted-sync/accept': MAX_ACCEPT_BYTES,

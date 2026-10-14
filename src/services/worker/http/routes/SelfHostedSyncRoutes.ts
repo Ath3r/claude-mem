@@ -5,6 +5,7 @@ import { logger } from '../../../../utils/logger.js';
 import type { DatabaseManager } from '../../DatabaseManager.js';
 import { getWorkerHost } from '../../../../shared/worker-utils.js';
 import { LARGE_SYNC_BODY_LIMITS } from '../../../sync/self-hosted/protocol.js';
+import type { SessionRemapPlan } from '../../../sync/self-hosted/session-remap.js';
 import type { BootstrapPlan } from '../../../sync/self-hosted/bootstrap.js';
 import type { Baseline } from '../../../sync/self-hosted/SelfHostedSync.js';
 
@@ -46,8 +47,8 @@ export class SelfHostedSyncRoutes {
     router.post('/reconcile', handle((req, res) => { res.json(this.manager.getSelfHostedSync().reconcile(req.body as Baseline)); }));
     router.post('/setup', handle((req, res) => {
       if (this.manager.getCloudSync()) throw new Error('disable Pro sync before self-hosted setup');
-      const body = z.object({ independent: z.boolean().optional(), baseline: z.unknown().optional(), bootstrapPlan: z.unknown().optional(), workProjectAliases: z.array(z.array(z.string().min(1).max(4096)).min(2).max(256)).max(256).optional() }).strict().parse(req.body);
-      res.json(this.manager.getSelfHostedSync().setup({ independent: body.independent, baseline: body.baseline as Baseline | undefined, bootstrapPlan: body.bootstrapPlan as BootstrapPlan | undefined, workProjectAliases: body.workProjectAliases }));
+      const body = z.object({ independent: z.boolean().optional(), baseline: z.unknown().optional(), bootstrapPlan: z.unknown().optional(), sessionRemapPlan: z.unknown().optional(), workProjectAliases: z.array(z.array(z.string().min(1).max(4096)).min(2).max(256)).max(256).optional() }).strict().parse(req.body);
+      res.json(this.manager.getSelfHostedSync().setup({ independent: body.independent, baseline: body.baseline as Baseline | undefined, bootstrapPlan: body.bootstrapPlan as BootstrapPlan | undefined, sessionRemapPlan: body.sessionRemapPlan as SessionRemapPlan | undefined, workProjectAliases: body.workProjectAliases }));
     }));
     router.post('/enabled', handle((req, res) => { const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body); if (enabled && this.manager.getCloudSync()) throw new Error('disable Pro sync before enabling the private journal'); this.manager.getSelfHostedSync().setEnabled(enabled); res.json({ enabled }); }));
     router.post('/prepare', handle((req, res) => { const { peer } = z.object({ peer: z.string().uuid().optional() }).strict().parse(req.body); res.json(this.manager.getSelfHostedSync().prepare(peer)); }));
