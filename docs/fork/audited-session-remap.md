@@ -74,8 +74,8 @@ An exception on a reference-only parent is rejected. Completion-only
 approvals, but approvals for the same parent cannot overlap.
 
 The approved combined source at `8a468692` has regenerated worker bundles and
-fresh root/viewer typechecks. Combined disposable acceptance remains a release
-gate. The previous sealed reference-only artifacts do not validate this source
+fresh root/viewer typechecks. The newest specified combined snapshot has passed [disposable sync acceptance](combined-bootstrap-acceptance.md);
+full historical native Chroma acceptance remains a release gate. The previous sealed reference-only artifacts do not validate this source
 or the newer combined snapshot; those checkpoints remain retained unchanged.
 
 ## Verification contract
@@ -106,3 +106,7 @@ device backups, actual SSH convergence/no-ops and capture timings. Retain privat
 data fingerprints and total bootstrap time. Resume full-corpus native Chroma only
 after source/device/collection and formatter verification; require expected-ID
 coverage, native search/context, deletion and restart recovery. No live activation.
+
+See the [combined bootstrap report](combined-bootstrap-acceptance.md) for the
+newest specified snapshot, sealed artifact hashes, independent B/I/C audit, real
+SSH convergence/timings and the separate outstanding historical index gate.
