@@ -175,6 +175,23 @@ describe('self-hosted worker routes and manual CLI', () => {
     expect(a.sync.head()).toBe(2);
     expect(a.store.db.query('SELECT completed_at_epoch FROM sdk_sessions').get()).toEqual({ completed_at_epoch: Date.parse('2026-10-13T00:00:00.000Z') });
   });
+  it('passes a separate reviewed remap through CLI and route without widening the completion plan', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cmem-remap-cli-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const a = await worker(dir, 'a');
+    a.store.db.exec("INSERT INTO sdk_sessions(content_session_id,memory_session_id,project,started_at,started_at_epoch,status) VALUES('shared','old','project','2026-10-12T00:00:00.000Z',1,'completed')");
+    const hash = (v: unknown) => sha256Base64Url(canonicalJson(v));
+    const payload = () => portablePayload('session', a.store.db.query('SELECT * FROM sdk_sessions').get() as Record<string, unknown>);
+    const baseline = a.sync.baseline(), old = payload();
+    a.store.updateMemorySessionId(1, 'new');
+    const manifest = join(dir, 'baseline.json'), plan = join(dir, 'reviewed.json'), config = join(dir, 'sync.json');
+    writeFileSync(manifest, JSON.stringify(baseline), { mode: 0o600 });
+    writeFileSync(plan, JSON.stringify({ protocol: baseline.protocol, namespace: baseline.namespace, schema: baseline.schema, manifestHash: hash(baseline), sessionLocal: '1', oldMemorySessionId: 'old', newMemorySessionId: 'new', reason: 'Reviewed complete reference graph', independentRows: [], rows: [{kind: 'session', local: '1', expectedHash: hash(old), currentHash: hash(payload()), baselinePayload: old }] }), { mode: 0o600 });
+    expect((await cli(dir, 'setup', '--worker', a.url, '--config', config, '--manifest', manifest, '--bootstrap-plan', plan)).code).toBe(1);
+    expect(a.sync.configured()).toBe(false);
+    const result = await cli(dir, 'setup', '--worker', a.url, '--config', config, '--manifest', manifest, '--session-remap-plan', plan);
+    expect(result.code).toBe(0); expect(result.stderr).toBe(''); expect(a.sync.head()).toBe(2);
+    expect(payload().memory_session_id).toBe('new');
+  });
   it('baseline and reconcile CLI read explicit disposable stores without enabling or migrating them', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cmem-baseline-cli-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
     const a = await worker(dir, 'a');
