@@ -45,12 +45,20 @@ export class SearchManager {
     private sessionStore: SessionStore,
     private chromaSync: ChromaSync | null,
     private formatter: FormattingService,
-    private timelineService: TimelineService
+    private timelineService: TimelineService,
+    /**
+     * Implicit window, in milliseconds, that date-less semantic searches
+     * apply (CLAUDE_MEM_SEARCH_RECENCY_DAYS). Defaults to the shipped 90
+     * days; 0 disables the window so every semantic match stays eligible.
+     * An explicit `dateRange` on a request always wins over it.
+     */
+    private searchRecencyWindowMs: number = SEARCH_CONSTANTS.RECENCY_WINDOW_MS
   ) {
     this.orchestrator = new SearchOrchestrator(
       sessionSearch,
       sessionStore,
-      chromaSync
+      chromaSync,
+      searchRecencyWindowMs
     );
   }
 
@@ -118,7 +126,7 @@ export class SearchManager {
     const whereFilter = this.buildDocTypeWhereFilter(docType, readKeys, platformSource);
     const startEpoch = dateRange
       ? dateRange.start != null ? resolveDateBound(dateRange.start, 'start') : undefined
-      : Date.now() - SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
+      : this.searchRecencyWindowMs > 0 ? Date.now() - this.searchRecencyWindowMs : undefined;
     const endEpoch = dateRange?.end != null ? resolveDateBound(dateRange.end, 'end') : undefined;
     let candidateLimit: number = SEARCH_CONSTANTS.CHROMA_BATCH_SIZE;
     // Five ranked windows (100..1600), at most ten Chroma transport calls.
@@ -162,9 +170,10 @@ export class SearchManager {
     }
   }
 
-  private async searchChromaForTimeline(query: string, project?: string, platformSource?: string): Promise<ObservationSearchResult[]> {
-    return this.hybridSemanticHydrate(query, 'observation', project, platformSource, (ids) =>
-      this.sessionStore.getObservationsByIds(ids, { orderBy: 'relevance', limit: 1, project, platformSource })
+  private async searchChromaForTimeline(query: string, project?: string, platformSource?: string, projects?: string[]): Promise<ObservationSearchResult[]> {
+    return this.hybridSemanticHydrate(query, 'observation', project, platformSource, (ids, readKeys) =>
+      this.sessionStore.getObservationsByIds(ids, { orderBy: 'relevance', limit: 1, project, projects: readKeys, platformSource }),
+      projects,
     );
   }
 
@@ -361,7 +370,7 @@ export class SearchManager {
    * observations — the only category obs_type applies to.
    */
   private resolveTypeFilters(type: any, obs_type: any): { category: any; effectiveObsType: any } {
-    const CATEGORY_TYPES = ['observations', 'sessions', 'prompts'];
+    const CATEGORY_TYPES = ['all', 'observations', 'sessions', 'prompts'];
 
     if (type == null) {
       return { category: type, effectiveObsType: obs_type };
@@ -371,7 +380,7 @@ export class SearchManager {
     const isCategorySelector = typeValues.length > 0 && typeValues.every(t => CATEGORY_TYPES.includes(t));
 
     if (isCategorySelector) {
-      return { category: type, effectiveObsType: obs_type };
+      return { category: typeValues.includes('all') ? 'all' : type, effectiveObsType: obs_type };
     }
 
     const existingObsType = Array.isArray(obs_type)
@@ -427,8 +436,8 @@ export class SearchManager {
         if (dateRange.end) {
           endEpoch = resolveDateBound(dateRange.end, 'end');
         }
-      } else {
-        startEpoch = Date.now() - SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
+      } else if (this.searchRecencyWindowMs > 0) {
+        startEpoch = Date.now() - this.searchRecencyWindowMs;
       }
 
       const recentMetadata = chromaResults.metadatas.map((meta, idx) => ({
@@ -439,7 +448,12 @@ export class SearchManager {
           && (!endEpoch || meta.created_at_epoch <= endEpoch)
       })).filter(item => item.isRecent);
 
-      logger.debug('SEARCH', dateRange ? 'Results within user date range' : 'Results within 90-day window', { count: recentMetadata.length });
+      const windowLabel = dateRange
+        ? 'Results within user date range'
+        : this.searchRecencyWindowMs > 0
+          ? `Results within ${this.searchRecencyWindowMs / 86_400_000}-day window`
+          : 'Results across full history (recency window disabled)';
+      logger.debug('SEARCH', windowLabel, { count: recentMetadata.length });
 
       const obsIds: number[] = [];
       const sessionIds: number[] = [];
@@ -465,7 +479,7 @@ export class SearchManager {
       }
       if (sessionIds.length > 0) {
         sessions = this.sessionStore.getSessionSummariesByIds(sessionIds, {
-          orderBy: requestedDateOrder ?? 'date_desc',
+          orderBy: requestedDateOrder ?? 'relevance',
           limit: options.limit,
           project: options.project,
           projects: options.projects,
@@ -474,7 +488,7 @@ export class SearchManager {
       }
       if (promptIds.length > 0) {
         prompts = this.sessionStore.getUserPromptsByIds(promptIds, {
-          orderBy: requestedDateOrder ?? 'date_desc',
+          orderBy: requestedDateOrder ?? 'relevance',
           limit: options.limit,
           project: options.project,
           projects: options.projects,
@@ -871,7 +885,9 @@ export class SearchManager {
 
   async timeline(args: any): Promise<any> {
     const normalized = this.normalizeParams(args);
-    const { anchor, query, depth_before, depth_after, project, platformSource } = normalized;
+    const { anchor, query, depth_before, depth_after, project, projects, platformSource } = normalized;
+    const readKeys = projectReadKeysFor(this.sessionStore, project, projects);
+    const scope = { project, projects: readKeys, platformSource };
     // HTTP query strings and MCP numbers must describe whole, bounded SQL LIMITs.
     const parseDepth = (value: unknown): number => value == null ? 10
       : typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')
@@ -918,7 +934,7 @@ export class SearchManager {
       if (this.chromaSync) {
         logger.debug('SEARCH', 'Using hybrid semantic search for timeline query', {});
         try {
-          results = await this.searchChromaForTimeline(query, project, platformSource);
+          results = await this.searchChromaForTimeline(query, project, platformSource, projects);
         } catch (chromaError) {
           const errorObject = chromaError instanceof Error ? chromaError : new Error(String(chromaError));
           logger.error('WORKER', 'Chroma search failed for timeline, continuing without semantic results', {}, errorObject);
@@ -927,7 +943,7 @@ export class SearchManager {
 
       if (results.length === 0) {
         try {
-          const ftsResults = this.sessionSearch.searchObservations(query, { project, platformSource, limit: 1 });
+          const ftsResults = this.sessionSearch.searchObservations(query, { ...scope, limit: 1 });
           if (ftsResults.length > 0) {
             results = ftsResults;
           }
@@ -949,11 +965,11 @@ export class SearchManager {
       anchorId = topResult.id;
       anchorEpoch = topResult.created_at_epoch;
       logger.debug('SEARCH', 'Query mode: Using observation as timeline anchor', { observationId: topResult.id });
-      timelineData = this.sessionStore.getTimelineAroundObservation(topResult.id, topResult.created_at_epoch, depthBefore, depthAfter, project, platformSource);
+      timelineData = this.sessionStore.getTimelineAroundObservation(topResult.id, topResult.created_at_epoch, depthBefore, depthAfter, project, platformSource, readKeys);
     }
     // MODE 2: Anchor-based timeline
     else if (anchorAsNumber !== null) {
-      const obs = this.sessionStore.getObservationsByIds([anchorAsNumber], { project, platformSource, limit: 1 })[0] ?? null;
+      const obs = this.sessionStore.getObservationsByIds([anchorAsNumber], { ...scope, limit: 1 })[0] ?? null;
       if (!obs) {
         return {
           content: [{
@@ -965,7 +981,7 @@ export class SearchManager {
       }
       anchorId = anchorAsNumber;
       anchorEpoch = obs.created_at_epoch;
-      timelineData = this.sessionStore.getTimelineAroundObservation(anchorAsNumber, anchorEpoch, depthBefore, depthAfter, project, platformSource);
+      timelineData = this.sessionStore.getTimelineAroundObservation(anchorAsNumber, anchorEpoch, depthBefore, depthAfter, project, platformSource, readKeys);
     } else if (typeof anchor === 'string') {
       if (anchor.startsWith('S') || anchor.startsWith('#S')) {
         const sessionMatch = /^#?S(\d+)$/.exec(anchor);
@@ -973,7 +989,7 @@ export class SearchManager {
         if (!Number.isSafeInteger(sessionNum) || sessionNum <= 0) {
           return { content: [{ type: 'text' as const, text: 'Invalid session anchor: must be S followed by a positive safe integer' }], isError: true };
         }
-        const sessions = this.sessionStore.getSessionSummariesByIds([sessionNum], { project, platformSource });
+        const sessions = this.sessionStore.getSessionSummariesByIds([sessionNum], scope);
         if (sessions.length === 0) {
           return {
             content: [{
@@ -985,7 +1001,7 @@ export class SearchManager {
         }
         anchorEpoch = sessions[0].created_at_epoch;
         anchorId = `S${sessionNum}`;
-        timelineData = this.sessionStore.getTimelineAroundTimestamp(anchorEpoch, depthBefore, depthAfter, project, platformSource);
+        timelineData = this.sessionStore.getTimelineAroundTimestamp(anchorEpoch, depthBefore, depthAfter, project, platformSource, readKeys);
       } else {
         const date = new Date(anchor);
         if (isNaN(date.getTime())) {
@@ -999,7 +1015,7 @@ export class SearchManager {
         }
         anchorEpoch = date.getTime();
         anchorId = anchor;
-        timelineData = this.sessionStore.getTimelineAroundTimestamp(anchorEpoch, depthBefore, depthAfter, project, platformSource);
+        timelineData = this.sessionStore.getTimelineAroundTimestamp(anchorEpoch, depthBefore, depthAfter, project, platformSource, readKeys);
       }
     } else {
       return {
@@ -1261,7 +1277,7 @@ export class SearchManager {
 
   async getTimelineByQuery(args: any): Promise<any> {
     const normalized = this.normalizeParams(args);
-    const { query, mode = 'auto', limit = 5, project, platformSource } = normalized;
+    const { query, mode, limit = 5, project, platformSource } = normalized;
 
     if (mode !== 'interactive') {
       return this.timeline(args);

@@ -37,7 +37,7 @@ function route(d: Device, cloudSync: unknown = null) {
   const broadcasts: unknown[] = [];
   const handlers = new Map<string, (req: Request, res: Response) => void>();
   const routes = new DataRoutes({} as any, {
-    getSessionStore: () => d.store, getCloudSync: () => cloudSync, getSelfHostedSync: () => d.sync,
+    getSessionStore: () => d.store, getCloudSync: () => cloudSync, getSelfHostedSync: () => d.sync, getChromaSync: () => null,
   } as any, {} as any, { broadcast: (event: unknown) => broadcasts.push(event) } as any, {} as any, Date.now());
   routes.setupRoutes({
     get() {}, post() {},

@@ -17,11 +17,13 @@ import { redactForLog } from '../../../utils/redaction.js';
 export function createMiddleware(): RequestHandler[] {
   const middlewares: RequestHandler[] = [];
 
-  const defaultJson = express.json({ limit: '5mb' });
-  // Large sync bodies are parsed by their router, after its loopback/auth gate.
-  middlewares.push((req, res, next) => {
+  const parseJson = express.json({ limit: '5mb' });
+  middlewares.push((req: Request, res: Response, next: NextFunction) => {
+    // Large sync bodies are parsed by their router, after its loopback/auth gate.
     if (req.method === 'POST' && Object.hasOwn(LARGE_SYNC_BODY_LIMITS, req.path)) return next();
-    return defaultJson(req, res, next);
+    // Spool ingestion authenticates before applying its own body limit.
+    if (req.method === 'POST' && /^\/api\/spool\/ingest\/?$/i.test(req.path)) return next();
+    parseJson(req, res, next);
   });
 
   middlewares.push((req: Request, res: Response, next: NextFunction) => {
@@ -50,6 +52,13 @@ export function createMiddleware(): RequestHandler[] {
 
   const packageRoot = getPackageRoot();
   const uiDir = path.join(packageRoot, 'plugin', 'ui');
+  middlewares.push((req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/work-view/')) {
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+      res.setHeader('X-Frame-Options', 'DENY');
+    }
+    next();
+  });
   middlewares.push(express.static(uiDir));
 
   return middlewares;

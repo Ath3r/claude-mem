@@ -36,10 +36,11 @@ describe('private SSH sync causal journal', () => {
     store.appendWorkStateEntry({ project: 'z-old', listName: 'release', fields: { task: 'ship', status: 'todo' }, createdAtEpoch: 9000 });
     store.appendWorkStateEntry({ project: 'a-new', listName: 'release', fields: { task: 'ship', status: 'done' }, createdAtEpoch: 1000 });
     const sync = new SelfHostedSync(store.db);
-    expect(foldWorkStateList(store.getWorkStateEntries(['z-old', 'a-new'], 'release')).tasks.get('ship')!.fields.status).toBe('done');
+    // Native folding follows upstream's write-clock order; a refused activation must leave it untouched.
+    const nativeStatus = foldWorkStateList(store.getWorkStateEntries(['z-old', 'a-new'], 'release')).tasks.get('ship')!.fields.status;
     expect(() => sync.setup({ independent: true })).toThrow('ambiguous work project aliases');
     expect(sync.configured()).toBe(false);
-    expect(foldWorkStateList(store.getWorkStateEntries(['z-old', 'a-new'], 'release')).tasks.get('ship')!.fields.status).toBe('done');
+    expect(foldWorkStateList(store.getWorkStateEntries(['z-old', 'a-new'], 'release')).tasks.get('ship')!.fields.status).toBe(nativeStatus);
   });
 
   it('canonicalizes reviewed historical aliases in native append order and preserves completion after exchange', () => {

@@ -16,8 +16,8 @@ import { ClassifiedProviderError, rateLimitUntilNextKey, type ProviderErrorClass
 import type { PaidSendBudget } from './paid-send-budget.js';
 import { withRetry, parseRetryAfterMs } from './retry.js';
 import {
-  DEFAULT_LLM_STREAM_IDLE_TIMEOUT_MS,
   STREAMED_REQUEST_FIELDS,
+  resolveStreamIdleTimeoutMs,
   resolveStreamLiveness,
   sendChatCompletion,
   streamsChatCompletion,
@@ -518,7 +518,11 @@ export function buildOpenRouterRequestBody(input: {
   // openrouter.ai itself, or the cmem gateway, which forwards the body there.
   const reachesOpenRouter = isOpenRouter || isCmemGatewayUrl(input.apiUrl);
   const useFallbacks = isOpenRouter && input.fallbackModels.length > 0;
-  const typedReasoning = isOpenRouter && !input.plainText && input.reasoningEffort !== undefined;
+  // A field condensation is a short rewrite like a wrap-up: a reasoning model
+  // otherwise spends the whole output cap thinking and the pass is discarded
+  // as cut off (#2995).
+  const answerOnly = input.plainText || input.label?.kind === 'field_compression';
+  const typedReasoning = isOpenRouter && !answerOnly && input.reasoningEffort !== undefined;
   return withOpenRouterExtraBody({
     ...(useFallbacks
       ? { models: [input.model, ...input.fallbackModels] }
@@ -535,7 +539,7 @@ export function buildOpenRouterRequestBody(input: {
     // Keep the same model, but ask for an answer instead of spending this
     // short rewrite's budget on reasoning. Only known OpenRouter endpoints
     // accept the vendor-specific reasoning control (cmem forwards it).
-    ...(input.plainText && reachesOpenRouter ? {
+    ...(answerOnly && reachesOpenRouter ? {
       response_format: { type: 'text' },
       reasoning: { enabled: false },
     } : {}),
@@ -553,7 +557,9 @@ export function buildOpenRouterRequestBody(input: {
     // OpenRouter. A custom gateway gets neither: strict ones 400 on unknown
     // body fields.
     ...(input.label && reachesOpenRouter ? openRouterRequestLabels(input.label) : {}),
-  }, typedReasoning ? withoutReasoning(input.extraBody) : input.extraBody, input.apiUrl, input.plainText);
+  }, typedReasoning ? withoutReasoning(input.extraBody) : input.extraBody, input.apiUrl,
+  // A custom gateway gets no reasoning control above, so its extra body keeps its own.
+  input.plainText || (answerOnly && reachesOpenRouter));
 }
 
 /**
@@ -798,10 +804,12 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
   }
 
   /**
-   * Silence after which a streamed request is given up. An instance field so a
-   * test can shorten it; there is no setting for it.
+   * Overrides the streamed request's idle window when set — a test hook, the
+   * only reason this is a field. Unset, every request resolves
+   * CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS (#4737), so a settings change takes
+   * effect without a restart.
    */
-  protected streamIdleTimeoutMs: number = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_MS;
+  protected streamIdleTimeoutMs: number | undefined;
 
   /** POST the chat-completions request and read its (streamed) reply. */
   private requestChatCompletion(
@@ -879,7 +887,9 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
 
     // Decided once, so every attempt is bounded the way withRetry was told.
     const streamed = streamsChatCompletion(apiUrl);
-    const liveness = streamed ? resolveStreamLiveness(perAttemptTimeoutMs, this.streamIdleTimeoutMs) : null;
+    const liveness = streamed
+      ? resolveStreamLiveness(perAttemptTimeoutMs, this.streamIdleTimeoutMs ?? resolveStreamIdleTimeoutMs())
+      : null;
     const data = await withRetry<OpenRouterResponse>(async (attemptSignal) => {
       const exchange = await this.requestChatCompletion(
         apiUrl, apiKey, model, fallbackModels, messages, siteUrl, appName, clientAttemptId, attemptSignal,

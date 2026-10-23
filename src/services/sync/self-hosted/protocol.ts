@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { logger } from '../../../utils/logger.js';
 import { canonicalJson, sha256Base64Url, stableDocumentId, buildContentOperation, canonicalDecimalToSafeInteger } from '../CanonicalContent.js';
 
-export const PROTOCOL = 2;
+import { PROTOCOL } from './constants/protocol-version.js';
+export { PROTOCOL };
 export const PAGE_SIZE = 24;
 export const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 export const MAX_BASELINE_BYTES = 32 * 1024 * 1024;

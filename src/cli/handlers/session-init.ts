@@ -16,7 +16,8 @@ import { HOOK_EXIT_CODES, HOOK_TIMEOUTS } from '../../shared/hook-constants.js';
 import { shouldTrackProject as defaultShouldTrackProject } from '../../shared/should-track-project.js';
 import { loadFromFileOnce as defaultLoadFromFileOnce } from '../../shared/hook-settings.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
-import { isCodexInternalPrompt, isInternalProtocolPayload } from '../../utils/tag-stripping.js';
+import { workStatePlatform } from '../../shared/work-state-telemetry.js';
+import { isCodexInternalPrompt, isGrokBotInternalPrompt, isInternalProtocolPayload } from '../../utils/tag-stripping.js';
 import {
   resolveRuntimeContext as defaultResolveRuntimeContext,
   logServerFallback as defaultLogServerFallback,
@@ -136,6 +137,8 @@ export const isQwenCodeHookEvent = (
 
 const sessionInit = {
   async run(input: NormalizedHookInput, requireRecordedPrompt: boolean): Promise<HookResult> {
+    // The transcript anchor has no original event time. A real hook does.
+    const telemetryPromptEpochMs = requireRecordedPrompt ? undefined : Date.now();
     const { sessionId, prompt: rawPrompt, submittedPrompt } = input;
     const cwd = input.cwd ?? process.cwd();  
 
@@ -161,6 +164,17 @@ const sessionInit = {
     // text from another host is a person's prompt.
     if (rawPrompt && normalizePlatformSource(input.platform) === 'codex' && isCodexInternalPrompt(rawPrompt)) {
       logger.debug('HOOK', 'session-init: skipping a Codex internal helper prompt', {
+        reason: 'internal_system_prompt',
+        preview: rawPrompt.slice(0, 80),
+      });
+      return { continue: true, suppressOutput: true };
+    }
+
+    // Grok Bot runs its own research sub-agent briefings through the same hook
+    // as a user turn. Grok Bot only: the same text from another host is a
+    // person's prompt (#4811).
+    if (rawPrompt && normalizePlatformSource(input.platform) === 'grok-bot' && isGrokBotInternalPrompt(rawPrompt)) {
+      logger.debug('HOOK', 'session-init: skipping a Grok Bot internal helper prompt', {
         reason: 'internal_system_prompt',
         preview: rawPrompt.slice(0, 80),
       });
@@ -276,6 +290,10 @@ const sessionInit = {
         project,
         prompt,
         platformSource,
+        telemetryPlatformSource: workStatePlatform(input.platform),
+        telemetryPromptEpochMs,
+        agentId: input.agentId,
+        agentType: input.agentType,
         // Where `project` was resolved from and how, so the worker can record
         // the session's checkout even if it never reports an observation.
         cwd,
