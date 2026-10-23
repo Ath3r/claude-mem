@@ -24,6 +24,12 @@ import {
   type InstallRuntimeId,
 } from './server-runtime-setup.js';
 import { captureCliEvent } from '../../services/telemetry/cli-telemetry.js';
+import {
+  currentLauncherHostEnvironment,
+  removeInstalledLauncher,
+  resolveLauncherBinaryPath,
+  type LauncherRemovalResult,
+} from '../../launcher/install-launcher.js';
 
 // #2568 — read the runtime the operator installed so uninstall can dispatch to
 // the matching teardown. The worker path is the default and is unchanged: only
@@ -159,8 +165,8 @@ export function removeFromClaudeSettings(): void {
   }
 }
 
-function removeStrayClaudeMemPaths(): number {
-  const home = homedir();
+/** Exported for tests; `home` is injectable so tests never touch the real home directory. */
+export function removeStrayClaudeMemPaths(home: string = homedir()): number {
   let removedCount = 0;
 
   const npxRoot = join(home, '.npm', '_npx');
@@ -213,7 +219,7 @@ function removeStrayClaudeMemPaths(): number {
     }
   }
 
-  const pluginDataDir = join(home, '.claude', 'plugins', 'data', 'claude-mem-thedotmack');
+  const pluginDataDir = join(pluginsDirectory(), 'data', 'claude-mem-thedotmack');
   if (existsSync(pluginDataDir)) {
     try {
       rmSync(pluginDataDir, { recursive: true, force: true });
@@ -325,6 +331,8 @@ export async function runUninstallCommand(): Promise<void> {
     process.exitCode = 1;
   }
 
+  // Shell rc files and the Windows user Path are left alone; the hint names the line to remove.
+  const launcherRemovalOutcome: { result: LauncherRemovalResult | null } = { result: null };
   await p.tasks([
     {
       title: 'Removing marketplace directory',
@@ -376,6 +384,25 @@ export async function runUninstallCommand(): Promise<void> {
       },
     },
     {
+      title: 'Removing the claude-mem hook launcher',
+      task: async () => {
+        let launcherRemoval: LauncherRemovalResult;
+        try {
+          launcherRemoval = removeInstalledLauncher();
+        } catch (error: unknown) {
+          // [ANTI-PATTERN IGNORED]: reported as this task's result so the remaining
+          // uninstall tasks still run; on Windows a running claude-mem.exe cannot be deleted.
+          const launcherBinaryPath = resolveLauncherBinaryPath(currentLauncherHostEnvironment());
+          const failureMessage = error instanceof Error ? error.message : String(error);
+          return `Hook launcher in use; remove ${launcherBinaryPath} after closing Claude Code (${failureMessage}) ${styleText('yellow', 'WARN')}`;
+        }
+        launcherRemovalOutcome.result = launcherRemoval;
+        return launcherRemoval.removedBinaryPath
+          ? `Hook launcher removed (${launcherRemoval.removedBinaryPath}) ${styleText('green', 'OK')}`
+          : `Hook launcher not found ${styleText('dim', 'skipped')}`;
+      },
+    },
+    {
       title: 'Removing stray claude-mem caches and logs',
       task: async () => {
         const removed = removeStrayClaudeMemPaths();
@@ -391,6 +418,10 @@ export async function runUninstallCommand(): Promise<void> {
       const { uninstallT3Code } = await import('../../services/integrations/T3CodeInstaller.js');
       return uninstallT3Code();
     }},
+    { label: 'Hermes Agent memory provider', fn: async () => {
+      const { uninstallHermesIntegration } = await import('../../services/integrations/HermesInstaller.js');
+      return uninstallHermesIntegration();
+    }},
     { label: 'Pi memory', fn: async () => {
       const { uninstallPiExtension } = await import('../../services/integrations/PiInstaller.js');
       return uninstallPiExtension();
@@ -398,6 +429,10 @@ export async function runUninstallCommand(): Promise<void> {
     { label: 'Windsurf hooks', fn: async () => {
       const { uninstallWindsurfHooks } = await import('../../services/integrations/WindsurfHooksInstaller.js');
       return uninstallWindsurfHooks();
+    }},
+    { label: 'Goose MCP extension', fn: async () => {
+      const { uninstallGooseMcpIntegration } = await import('../../services/integrations/McpIntegrations.js');
+      return uninstallGooseMcpIntegration();
     }},
     { label: 'OpenCode plugin', fn: async () => {
       const { uninstallOpenCodePlugin } = await import('../../services/integrations/OpenCodeInstaller.js');
@@ -434,6 +469,10 @@ export async function runUninstallCommand(): Promise<void> {
     } catch (error: unknown) {
       console.warn(`[uninstall] ${label} cleanup failed:`, error instanceof Error ? error.message : String(error));
     }
+  }
+
+  if (launcherRemovalOutcome.result?.pathCleanupHint) {
+    p.log.info(launcherRemovalOutcome.result.pathCleanupHint);
   }
 
   p.note(

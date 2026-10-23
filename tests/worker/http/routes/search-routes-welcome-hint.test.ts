@@ -1,3 +1,7 @@
+import { Database } from 'bun:sqlite';
+import { SessionStore } from '../../../../src/services/sqlite/SessionStore.js';
+import { DataRoutes } from '../../../../src/services/worker/http/routes/DataRoutes.js';
+import { ContextCacheService } from '../../../../src/services/worker/ContextCacheService.js';
 
 import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
@@ -29,6 +33,8 @@ import {
 import { resolveConfigDirProfileKey } from '../../../../src/shared/EnvManager.js';
 import { getProjectContext } from '../../../../src/utils/project-name.js';
 import { buildWorkStateContextSection } from '../../../../src/services/context/sections/WorkStateRenderer.js';
+import { TEAM_BRIEF_RESERVE_CHARS } from '../../../../src/shared/teambrain.js';
+import { MEMORY_PLUGIN_INSTRUCTIONS } from '../../../../src/shared/memory-instructions.js';
 
 // The route reads the ledger from paths.dataDir() (CLAUDE_MEM_DATA_DIR, set to a
 // per-run temp dir by tests/preload.ts), so write it there for the health case.
@@ -92,7 +98,7 @@ describe('SearchRoutes Welcome Hint', () => {
     ];
 
     countQueryStub = mock(() => ({ count: 0 }));
-    prepareStub = mock(() => ({ get: countQueryStub }));
+    prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
     mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = {
       getSessionStore: () => mockSessionStore,
@@ -217,7 +223,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
   it('skips the welcome hint when at least one observation exists', async () => {
     countQueryStub = mock(() => ({ count: 7 }));
-    prepareStub = mock(() => ({ get: countQueryStub }));
+    prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
     mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
@@ -273,7 +279,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
   it('threads normalized platformSource into observation count and context generation', async () => {
     countQueryStub = mock(() => ({ count: 2 }));
-    prepareStub = mock(() => ({ get: countQueryStub }));
+    prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
     mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
@@ -304,12 +310,13 @@ describe('SearchRoutes Welcome Hint', () => {
         platformSource: 'cursor',
       }),
       false,
+      expect.objectContaining({ execution: 'inline' }),
     );
   });
 
   it('does not leak positive observation state across route instances', async () => {
     countQueryStub = mock(() => ({ count: 3 }));
-    prepareStub = mock(() => ({ get: countQueryStub }));
+    prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
     mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
@@ -324,7 +331,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
     generateContextStub.mockClear();
     countQueryStub = mock(() => ({ count: 0 }));
-    prepareStub = mock(() => ({ get: countQueryStub }));
+    prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
     mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
@@ -340,6 +347,67 @@ describe('SearchRoutes Welcome Hint', () => {
     expect(body).toContain('# claude-mem status');
     expect(generateContextStub).not.toHaveBeenCalled();
   });
+
+  for (const count of [1, 2]) {
+  it(`rechecks whether memory remains after deleting one of ${count} observations in the same worker`, async () => {
+    const db = new Database(':memory:');
+    const store = new SessionStore(db);
+    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch)
+      VALUES ('hint-delete-content', 'hint-delete-session', 'hint-delete-project', '2026-10-12T00:00:00Z', 1)`).run();
+    db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, created_at, created_at_epoch)
+      VALUES ('hint-delete-session', 'hint-delete-project', 'discovery', 'one memory', '2026-10-12T00:00:00Z', 1)`).run();
+    if (count === 2) db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, created_at, created_at_epoch)
+      VALUES ('hint-delete-session', 'hint-delete-project', 'discovery', 'other memory', '2026-10-12T00:00:01Z', 2)`).run();
+    const previousDataDir = process.env.CLAUDE_MEM_DATA_DIR;
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'welcome-delete-context-'));
+    process.env.CLAUDE_MEM_DATA_DIR = fixtureDir;
+    const cache = new ContextCacheService({
+      debounceMs: 60_000,
+      expandProjectReadKeys: projects => projects,
+      renderVariant: async () => ({ body: '', cacheable: false }),
+    });
+    cache.start();
+    try {
+      const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => store } as any, cache));
+      const request = { query: { projects: 'hint-delete-project' } } as unknown as Request;
+      const first = createMockRes();
+      handler(request, first as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(generateContextStub).toHaveBeenCalledTimes(1);
+      expect((first.send as any).mock.calls[0][0]).toContain('CONTEXT_FROM_GENERATOR');
+
+      let remove: ((req: Request, res: Response) => void) | undefined;
+      const dataRoutes = new DataRoutes({} as any,
+        { getSessionStore: () => store, getCloudSync: () => null, getChromaSync: () => null } as any,
+        {} as any, { broadcast: () => {} } as any, {} as any, Date.now());
+      dataRoutes.setupRoutes({ get: () => {}, post: () => {}, delete: (path: string, fn: typeof remove) => {
+        if (path === '/api/observation/:id') remove = fn;
+      }} as any);
+      const deleted = createMockRes();
+      remove!({ params: { id: '1' } } as unknown as Request, deleted as unknown as Response);
+      expect(deleted.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+      expect((db.prepare('SELECT COUNT(*) AS count FROM observations').get() as {count: number}).count).toBe(count - 1);
+      expect(cache.removalGenerationNow()).toBe(1);
+      generateContextStub.mockClear();
+      const empty = createMockRes();
+      handler(request, empty as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+      if (count === 1) {
+        expect((empty.send as any).mock.calls[0][0]).toContain('This project has no memory yet.');
+        expect(generateContextStub).not.toHaveBeenCalled();
+      } else {
+        expect((empty.send as any).mock.calls[0][0]).toContain('CONTEXT_FROM_GENERATOR');
+        expect(generateContextStub).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      cache.stop();
+      db.close();
+      if (previousDataDir === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
+      else process.env.CLAUDE_MEM_DATA_DIR = previousDataDir;
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+  }
 
   it('uses the request-local worker port env override in the welcome hint URL', async () => {
     process.env.CLAUDE_MEM_WORKER_PORT = '43210';
@@ -365,7 +433,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
     it('leads the context with what is still open and takes its length off the memory budget', async () => {
       countQueryStub = mock(() => ({ count: 7 }));
-      prepareStub = mock(() => ({ get: countQueryStub }));
+      prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
       mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
       // Both request keys are checkout aliases. Match the scope annotation
       // supplied by SessionStore.getWorkStateEntries for those explicit keys.
@@ -389,7 +457,7 @@ describe('SearchRoutes Welcome Hint', () => {
       const placeholderSectionLength = buildWorkStateContextSection(renderedEntries, 'placeholders').length;
       const filledSectionLength = body.length - '\n\nCONTEXT_FROM_GENERATOR'.length;
       expect(placeholderSectionLength).toBeGreaterThanOrEqual(filledSectionLength);
-      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: placeholderSectionLength + 2 }), false);
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: placeholderSectionLength + 2 }), false, expect.objectContaining({ execution: 'inline' }));
     });
 
     it('leads the welcome hint with what is still open', async () => {
@@ -411,7 +479,7 @@ describe('SearchRoutes Welcome Hint', () => {
     it('leaves the work state out when CLAUDE_MEM_WORK_STATE_ENABLED=false', async () => {
       process.env.CLAUDE_MEM_WORK_STATE_ENABLED = 'false';
       countQueryStub = mock(() => ({ count: 7 }));
-      prepareStub = mock(() => ({ get: countQueryStub }));
+      prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
       mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
       workStateEntriesStub.mockImplementation(releaseEntries);
       const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
@@ -422,7 +490,36 @@ describe('SearchRoutes Welcome Hint', () => {
 
       expect(workStateEntriesStub).not.toHaveBeenCalled();
       expect(res.send).toHaveBeenCalledWith('CONTEXT_FROM_GENERATOR');
-      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: 0 }), false);
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: 0 }), false, expect.objectContaining({ execution: 'inline' }));
+    });
+
+    it('leaves room for the TeamBrain brief and the memory instructions the hook appends once the install is in a team', async () => {
+      process.env.CLAUDE_MEM_WORK_STATE_ENABLED = 'false';
+      countQueryStub = mock(() => ({ count: 7 }));
+      prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
+      mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
+      const render = async () => {
+        generateContextStub.mockClear();
+        const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
+        handler({ query: { projects: '/path/to/active-project' } } as unknown as Request, createMockRes() as unknown as Response);
+        await new Promise(resolve => setImmediate(resolve));
+      };
+      try {
+        process.env.CLAUDE_MEM_TEAMBRAIN_URL = 'https://cmem.ai';
+        await render();
+        expect(generateContextStub).toHaveBeenCalledWith(
+          expect.objectContaining({ reserveChars: TEAM_BRIEF_RESERVE_CHARS + MEMORY_PLUGIN_INSTRUCTIONS.length + 2 }),
+          false,
+          expect.objectContaining({ execution: 'inline' }),
+        );
+
+        process.env.CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED = 'false';
+        await render();
+        expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: TEAM_BRIEF_RESERVE_CHARS }), false, expect.objectContaining({ execution: 'inline' }));
+      } finally {
+        delete process.env.CLAUDE_MEM_TEAMBRAIN_URL;
+        delete process.env.CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED;
+      }
     });
 
     it('leaves the work state out of the welcome hint when CLAUDE_MEM_WORK_STATE_ENABLED=false', async () => {
@@ -441,7 +538,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
     it('leaves the work state out of the colored terminal preview, which is for the human', async () => {
       countQueryStub = mock(() => ({ count: 7 }));
-      prepareStub = mock(() => ({ get: countQueryStub }));
+      prepareStub = mock(() => ({ get: countQueryStub, finalize: () => {} }));
       mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
       workStateEntriesStub.mockImplementation(releaseEntries);
       const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
@@ -452,7 +549,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
       expect(workStateEntriesStub).not.toHaveBeenCalled();
       expect(res.send).toHaveBeenCalledWith('CONTEXT_FROM_GENERATOR');
-      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: 0 }), true);
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: 0 }), true, expect.objectContaining({ execution: 'inline' }));
     });
   });
 
@@ -464,7 +561,7 @@ describe('SearchRoutes Welcome Hint', () => {
 
     const searchManagerWithObservations = () => ({
       getSessionStore: () => ({
-        db: { prepare: mock(() => ({ get: mock(() => ({ count: 1 })) })) },
+        db: { prepare: mock(() => ({ get: mock(() => ({ count: 1 })), finalize: () => {} })) },
         getWorkStateEntries: workStateEntriesStub,
       }),
     });

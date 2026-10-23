@@ -99,7 +99,7 @@ export class PaginationHelper {
       query += ` WHERE ${conditions.join(' AND ')}`;
     }
 
-    query += ' ORDER BY o.created_at_epoch DESC LIMIT ? OFFSET ?';
+    query += ' ORDER BY o.created_at_epoch DESC, o.id DESC LIMIT ? OFFSET ?';
     params.push(limit + 1, offset);
 
     const results = db.prepare(query).all(...params) as Observation[];
@@ -131,6 +131,7 @@ export class PaginationHelper {
         ss.next_steps,
         ss.notes,
         ss.project,
+        ss.merged_into_project,
         ss.created_at,
         ss.created_at_epoch
       FROM session_summaries ss
@@ -162,7 +163,7 @@ export class PaginationHelper {
       query += ` WHERE ${conditions.join(' AND ')}`;
     }
 
-    query += ' ORDER BY ss.created_at_epoch DESC LIMIT ? OFFSET ?';
+    query += ' ORDER BY ss.created_at_epoch DESC, ss.id DESC LIMIT ? OFFSET ?';
     params.push(limit + 1, offset);
 
     const stmt = db.prepare(query);
@@ -218,7 +219,9 @@ export class PaginationHelper {
       NOT EXISTS (
         SELECT 1
         FROM user_prompts duplicate
-        WHERE duplicate.session_db_id = up.session_db_id
+        WHERE up.native_prompt_id IS NULL
+          AND duplicate.native_prompt_id IS NULL
+          AND duplicate.session_db_id = up.session_db_id
           AND duplicate.prompt_text = up.prompt_text
           AND (
             duplicate.created_at_epoch > up.created_at_epoch
@@ -236,7 +239,7 @@ export class PaginationHelper {
       query += ` WHERE ${conditions.join(' AND ')}`;
     }
 
-    query += ' ORDER BY up.created_at_epoch DESC LIMIT ? OFFSET ?';
+    query += ' ORDER BY up.created_at_epoch DESC, up.id DESC LIMIT ? OFFSET ?';
     params.push(limit + 1, offset);
 
     const stmt = db.prepare(query);

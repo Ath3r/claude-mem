@@ -21,6 +21,7 @@ import { ErrorSeverity } from '../src/npx-cli/install/error-taxonomy';
 import { IS_WINDOWS } from '../src/npx-cli/utils/paths';
 
 const SETUP_RUNTIME_SOURCE_PATH = join(import.meta.dir, '..', 'src', 'npx-cli', 'install', 'setup-runtime.ts');
+const TOOL_PATH_SOURCE_PATH = join(import.meta.dir, '..', 'src', 'npx-cli', 'install', 'tool-path.ts');
 const SHARED_SPAWN_SOURCE_PATH = join(import.meta.dir, '..', 'src', 'shared', 'spawn.ts');
 const DOCTOR_SOURCE_PATH = join(import.meta.dir, '..', 'src', 'npx-cli', 'commands', 'doctor.ts');
 
@@ -229,12 +230,16 @@ describe('installPluginDependencies passes the bun path as an argument, not thro
 
 describe('setup-runtime Windows spawn hygiene', () => {
   it('does not use shell: IS_WINDOWS for bun/uv version probes', () => {
+    // The probes live in tool-path.ts (shared with plugin/scripts/ensure-launcher.cjs).
     const source = readFileSync(SETUP_RUNTIME_SOURCE_PATH, 'utf-8');
+    const toolPathSource = readFileSync(TOOL_PATH_SOURCE_PATH, 'utf-8');
     const sharedSpawnSource = readFileSync(SHARED_SPAWN_SOURCE_PATH, 'utf-8');
     expect(source).not.toContain('shell: IS_WINDOWS');
-    expect(source).toContain('buildSpawnSyncInvocation(command, args, options)');
-    expect(source).toContain('lookupWindowsCommand(command)');
-    expect(sharedSpawnSource).toContain("spawnSync('where', [command]");
+    expect(toolPathSource).not.toContain('shell: IS_WINDOWS');
+    expect(toolPathSource).toContain('buildSpawnSyncInvocation(command, args, options)');
+    expect(toolPathSource).toContain('lookupWindowsCommand(command)');
+    expect(sharedSpawnSource).toContain('spawnSync(windowsWhereExecutablePath(), [command]');
+    expect(sharedSpawnSource).not.toContain("spawnSync('where'");
     expect(sharedSpawnSource).toContain('windowsHide: true');
   });
 });
@@ -315,7 +320,7 @@ describe('tree-sitter CLI provisioning (#2910)', () => {
   it('runs the package install script when the executable is missing', async () => {
     const cliDir = writeCliPackage(materializingInstallScript());
 
-    await expect(ensureTreeSitterCliBinary(tempDir, TREE_SITTER_INSTALL_TIMEOUT_MS, pinRepoBinary)).resolves.toBeUndefined();
+    await expect(ensureTreeSitterCliBinary(tempDir, TREE_SITTER_INSTALL_TIMEOUT_MS, pinRepoBinary)).resolves.toBe('release');
     expect(existsSync(treeSitterCliBinaryPath(tempDir))).toBe(true);
     expect(readdirSync(cliDir).filter(entry => entry.startsWith('.provision-'))).toEqual([]);
   });
@@ -340,7 +345,7 @@ describe('tree-sitter CLI provisioning (#2910)', () => {
     const cliDir = writeCliPackage(partialDownloadScript(''));
 
     await expect(ensureTreeSitterCliBinary(tempDir, TREE_SITTER_INSTALL_TIMEOUT_MS, () => sha256('half a download')))
-      .rejects.toThrow('without creating a working executable');
+      .rejects.toThrow('matches the pinned SHA-256 but cannot run on this system');
     expectNothingLeftInPlace(cliDir);
   });
 
@@ -380,7 +385,7 @@ echo 'tree-sitter 0.26.9'
     chmodSync(binaryPath, 0o755);
 
     const startedAt = Date.now();
-    await expect(ensureTreeSitterCliBinary(tempDir, TREE_SITTER_INSTALL_TIMEOUT_MS)).resolves.toBeUndefined();
+    await expect(ensureTreeSitterCliBinary(tempDir, TREE_SITTER_INSTALL_TIMEOUT_MS)).resolves.toBe('already-usable');
     expect(Date.now() - startedAt).toBeLessThan(2000);
   });
 

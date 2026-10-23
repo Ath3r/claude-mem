@@ -61,6 +61,9 @@ jobs:
       - name: Test (openclaw)
         run: bun test openclaw
 
+      - name: Test (Hermes provider, Python)
+        run: python3 -B -m unittest discover -s tests/hermes -v
+
   # #3482 was first characterised as a Windows bug, but a bare SIGKILL on the
   # stale worker orphans the identical uvx -> uv -> python chain on POSIX (the
   # descendants re-parent to init instead of surviving a single-PID
@@ -232,6 +235,11 @@ jobs:
       - name: Install sync-api dependencies
         working-directory: services/sync-api
         run: bun install --frozen-lockfile
+
+      - name: Generation attempt ownership (Postgres)
+        env:
+          CLAUDE_MEM_DATA_DIR: ${{ runner.temp }}/claude-mem-generation-data
+        run: CLAUDE_MEM_TEST_POSTGRES_URL="$DATABASE_URL" bun test tests/server/generation/generation-attempt-fencing.test.ts
 
       - name: sync-api unit and protocol tests
         working-directory: services/sync-api

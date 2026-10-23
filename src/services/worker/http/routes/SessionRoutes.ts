@@ -5,7 +5,8 @@ import { ingestObservation, ingestSummarize, ingestSessionEnd, type IngestContex
 import { validateBody } from '../middleware/validateBody.js';
 import { requireLocalhost } from '../middleware.js';
 import { logger } from '../../../../utils/logger.js';
-import { stripMemoryTags, isCodexInternalPrompt, isInternalProtocolPayload } from '../../../../utils/tag-stripping.js';
+import { logChromaWriteFailure } from '../../search/errors.js';
+import { stripMemoryTags, isCodexInternalPrompt, isGrokBotInternalPrompt, isInternalProtocolPayload } from '../../../../utils/tag-stripping.js';
 import { SessionManager } from '../../SessionManager.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
 import { ClaudeProvider } from '../../ClaudeProvider.js';
@@ -13,6 +14,7 @@ import { GeminiProvider } from '../../GeminiProvider.js';
 import { OpenRouterProvider } from '../../OpenRouterProvider.js';
 import { OpenAICompatProvider } from '../../OpenAICompatProvider.js';
 import type { CodexProvider } from '../../CodexProvider.js';
+import { claudeQuotaStandIn } from '../../../../shared/claude-fallback-readiness.js';
 import { getSelectedProvider, recordCmemFallbackIfEligible, releaseCmemGatewayProbe, selectProviderForGenerator, type SelectableProvider } from '../../provider-dispatch.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
@@ -25,6 +27,7 @@ import { getProjectContext, isProjectKeySource } from '../../../../utils/project
 import { isProjectExcluded } from '../../../../utils/project-filter.js';
 import { startGeneratorWithProvider } from '../../session/GeneratorRunner.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
+import { recordWorkStatePrompt, recordWorkStatePrivacy } from '../../../telemetry/work-state.js';
 import { firstPartySkillFromSlashPrompt } from '../../../telemetry/skill-id.js';
 import { SessionCompletionHandler } from '../../session/SessionCompletionHandler.js';
 import { USER_PROMPT_DEDUPE_WINDOW_MS } from '../../../../shared/user-prompts.js';
@@ -193,7 +196,9 @@ export class SessionRoutes extends BaseRouteHandler {
     if (!includeOperatorOnly && sessionIds.length > 0) {
       const provider = getSelectedProvider();
       const cooldown = getQuotaCooldown(provider);
-      if (cooldown && cooldownAppliesToCurrentAccount(cooldown)) {
+      // The quota-fallback credential serves while the primary one is held, so it paces nothing.
+      if (cooldown && cooldownAppliesToCurrentAccount(cooldown)
+        && !(provider === 'claude' && claudeQuotaStandIn())) {
         if (isQuotaCooldownActive(provider)) return 0;
         sessionIds = sessionIds.slice(0, 1);
       }
@@ -381,9 +386,10 @@ export class SessionRoutes extends BaseRouteHandler {
     // because the idle monitor only runs once the generator loop is
     // consuming messages. Abort the parked wait and restart with the new
     // provider immediately instead of leaving it stuck. A generator that HAS
-    // acquired its slot (mid-response) is left alone — falls through to the
-    // log-only "switch after it finishes" path below, unchanged.
-    if (session.currentProvider && session.currentProvider !== selectedProvider && isSessionParkedForSlot(sessionDbId)) {
+    // acquired its slot (mid-response) is not aborted here — it switches at
+    // its next message boundary (see below).
+    const providerChanged = Boolean(session.currentProvider && session.currentProvider !== selectedProvider);
+    if (providerChanged && isSessionParkedForSlot(sessionDbId)) {
       // Defensive re-guard: `session` is already narrowed non-null by the
       // early return above, but this branch spans a 3-operand `&&` plus a
       // trailing function call before any property access — re-asserting
@@ -412,17 +418,21 @@ export class SessionRoutes extends BaseRouteHandler {
     // keep the gateway re-probe it claimed on the way in.
     releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
 
-    if (session.currentProvider && session.currentProvider !== selectedProvider) {
-      logger.info('SESSION', `Provider changed, will switch after current generator finishes`, {
+    // A running generator in an active session never idles out, so it ends at
+    // its next message boundary and the runner resumes on the selected
+    // provider (#4846). Not when dispatch routes around the provider this
+    // generator runs on: it is that provider's probe, or its own failure moves
+    // the work to the fallback, so a switch would only restart a healthy run.
+    const switchNeeded = providerChanged && (selection.fallbackFrom ?? null) !== session.currentProvider;
+    if (switchNeeded && !session.providerSwitchPending) {
+      logger.info('SESSION', 'Provider changed, will switch at the next message boundary', {
         sessionId: sessionDbId,
         currentProvider: session.currentProvider,
         selectedProvider,
         historyLength: session.conversationHistory.length
       });
-      // Let current generator finish naturally, next one will use new provider.
-      // The buffered queue carries over; the next generator opens a new
-      // generation seeded from this session's memory (#3800, #3479).
     }
+    session.providerSwitchPending = switchNeeded;
   }
 
   /**
@@ -482,7 +492,12 @@ export class SessionRoutes extends BaseRouteHandler {
       // sees the window elapse at the same instant, so a bare check would let
       // them all through together.
       const admission = tryAdmitQuotaProbe(selectedProvider);
-      if (!admission.admitted) {
+      // The primary Claude credential is held: run on the quota-fallback one
+      // (dispatch logs the switch). No probe claim is taken; the primary's own
+      // probe still runs when its window elapses.
+      const standIn = !admission.admitted && selectedProvider === 'claude' ? claudeQuotaStandIn() : null;
+      session.claudeAuthOverride = standIn;
+      if (!admission.admitted && !standIn) {
         // This run is not starting, so it must not hold the gateway re-probe.
         releaseCmemGatewayProbe(gatewayProbeClaimId);
         const cooldown = getQuotaCooldown(selectedProvider);
@@ -684,6 +699,10 @@ export class SessionRoutes extends BaseRouteHandler {
       toolResponse: tool_response,
       cwd,
       platformSource,
+      telemetryPlatformSource: typeof req.body.telemetryPlatformSource === 'string'
+        ? req.body.telemetryPlatformSource : SessionRoutes.rawPlatformSourceFromRequest(req) ?? 'unknown',
+      enqueuedAtEpochMs: typeof req.body.enqueuedAtEpochMs === 'number' ? req.body.enqueuedAtEpochMs : undefined,
+      telemetryToolEpochMs: typeof req.body.telemetryToolEpochMs === 'number' ? req.body.telemetryToolEpochMs : undefined,
       agentId,
       agentType,
       toolUseId: typeof tool_use_id === 'string' ? tool_use_id : (typeof toolUseId === 'string' ? toolUseId : undefined),
@@ -762,6 +781,14 @@ export class SessionRoutes extends BaseRouteHandler {
     // suggestions) arrive like a user turn; Codex only (see the hook handler).
     if (rawPrompt && platformSource === 'codex' && isCodexInternalPrompt(rawPrompt)) {
       logger.debug('HTTP', 'session-init: skipping a Codex internal helper prompt before session creation', { contentSessionId });
+      res.json({ skipped: true, reason: 'internal_system_prompt' });
+      return;
+    }
+
+    // Grok Bot's own research sub-agent briefings arrive like a user turn;
+    // Grok Bot only (see the hook handler, #4811).
+    if (rawPrompt && platformSource === 'grok-bot' && isGrokBotInternalPrompt(rawPrompt)) {
+      logger.debug('HTTP', 'session-init: skipping a Grok Bot internal helper prompt before session creation', { contentSessionId });
       res.json({ skipped: true, reason: 'internal_system_prompt' });
       return;
     }
@@ -848,8 +875,17 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     const cleanedPrompt = stripMemoryTags(prompt);
+    const telemetryAttribution = {
+      contentSessionId,
+      enqueuedAtEpochMs: typeof req.body.telemetryPromptEpochMs === 'number' ? req.body.telemetryPromptEpochMs : undefined,
+      platformSource: typeof req.body.telemetryPlatformSource === 'string'
+        ? req.body.telemetryPlatformSource : SessionRoutes.rawPlatformSourceFromRequest(req),
+      agentId: typeof req.body.agentId === 'string' ? req.body.agentId : undefined,
+      agentType: typeof req.body.agentType === 'string' ? req.body.agentType : undefined,
+    };
 
     if (!cleanedPrompt || cleanedPrompt.trim() === '') {
+      recordWorkStatePrivacy(store.db, telemetryAttribution, true);
       logger.debug('HOOK', 'Session init - prompt entirely private', {
         sessionId: sessionDbId,
         promptNumber,
@@ -888,6 +924,10 @@ export class SessionRoutes extends BaseRouteHandler {
     const duplicatePrompt = nativeAnchor
       ? (nativeAnchor.duplicate ? { id: nativeAnchor.id, prompt_number: nativeAnchor.promptNumber } : undefined)
       : store.findRecentDuplicateUserPrompt(contentSessionId, cleanedPrompt, USER_PROMPT_DEDUPE_WINDOW_MS, sessionDbId);
+
+    // A newer public submission reopens coverage even if its text reuses a row.
+    // The recorder rejects missing/old timestamps and preserves newer boundaries.
+    recordWorkStatePrivacy(store.db, telemetryAttribution, false);
 
     if (duplicatePrompt) {
       const activeSession = this.sessionManager.getSession(sessionDbId);
@@ -937,6 +977,8 @@ export class SessionRoutes extends BaseRouteHandler {
       store.reopenCompletedSession(sessionDbId);
       savedUserPromptId = store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt, sessionDbId);
     }
+
+    recordWorkStatePrompt(store.db, telemetryAttribution, savedUserPromptId);
 
     // Fire-and-forget cloud sync nudge, beside the write itself so every
     // saved prompt nudges — including cursor sessions, which skip the
@@ -990,7 +1032,7 @@ export class SessionRoutes extends BaseRouteHandler {
             prompt: truncatedPrompt
           });
         }).catch((error) => {
-          logger.error('CHROMA', 'User prompt sync failed, continuing without vector search', {
+          logChromaWriteFailure('CHROMA', 'User prompt sync failed, continuing without vector search', {
             promptId: savedUserPrompt.id,
             prompt: promptText.length > 60 ? promptText.substring(0, 60) + '...' : promptText
           }, error);

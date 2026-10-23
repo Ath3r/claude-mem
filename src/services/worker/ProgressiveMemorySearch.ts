@@ -1,7 +1,7 @@
-import { randomBytes } from 'node:crypto';
-import { ProgressiveSearch, MemoryProgressiveCursorStore, projectMemoryContent, type ProgressiveSearchInput, type MemoryIndexRow, type MemoryDetail } from '../../shared/progressive-search.js';
+import { ProgressiveSearch, projectMemoryContent, type ProgressiveSearchInput, type MemoryIndexRow, type MemoryDetail } from '../../shared/progressive-search.js';
 import type { SearchManager } from './SearchManager.js';
 import type { SessionStore } from '../sqlite/SessionStore.js';
+import { SEARCH_CONSTANTS } from './search/types.js';
 import { logger } from '../../utils/logger.js';
 
 type StoredRow = {
@@ -23,17 +23,18 @@ function indexRow(row: StoredRow, kind: MemoryIndexRow['kind']): MemoryIndexRow 
   };
 }
 
-/** The worker uses the same bounded progressive protocol as remote MCP. */
+/** The worker runs the same dumb_search pipeline as remote MCP. */
 export class ProgressiveMemorySearch {
-  private readonly secret = randomBytes(32);
-  private readonly cursorStore = new MemoryProgressiveCursorStore();
-
   constructor(private readonly searchManager: SearchManager, private readonly store: SessionStore) {}
 
-  async run(input: ProgressiveSearchInput, scope = 'worker/global', projects?: string[] | string) {
+  async run(input: ProgressiveSearchInput, projects?: string[] | string) {
     const result = await new ProgressiveSearch({
       search: async ({ query, project, limit }) => {
-        const result = await this.searchManager.search({ query, project, projects, limit, format: 'json' });
+        // Hydrate the backend's whole first candidate window, not just `limit`
+        // rows: the title rerank below must see a weaker-ranked exact match
+        // before the index is cut to `limit` (#4865).
+        const candidateLimit = Math.max(limit, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE);
+        const result = await this.searchManager.search({ query, project, projects, limit: candidateLimit, format: 'json' });
         const terms = [...new Set(query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])];
         const categories: Array<[MemoryIndexRow['kind'], StoredRow[]]> = [
           ['observation', result.observations], ['summary', result.sessions], ['prompt', result.prompts],
@@ -50,10 +51,9 @@ export class ProgressiveMemorySearch {
       },
       timeline: async ({ anchor, depthBefore, depthAfter }) => this.timeline(anchor, depthBefore, depthAfter),
       fetch: async refs => this.fetch(refs),
-    }, { secret: this.secret, scope, cursorStore: this.cursorStore }).run(input);
-    logger.debug('SEARCH', 'Progressive memory search completed', {
-      mode: result.mode, step: result.step, indexCount: result.index.length,
-      detailCount: result.observations.length, complete: result.complete,
+    }).run(input);
+    logger.debug('SEARCH', 'Dumb search completed', {
+      step: result.step, indexCount: result.index.length, detailCount: result.observations.length,
     });
     return result;
   }

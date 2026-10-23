@@ -1,7 +1,6 @@
 import express, { Request, Response } from 'express';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
-import '../../../sqlite/manual-session.js';
 import {
   ingestMemorySource,
   claudeProjectsDir,
@@ -12,6 +11,7 @@ import {
 } from '../../../memory/ingest.js';
 import { computeObservationContentHash } from '../../../sqlite/observations/store.js';
 import { logger } from '../../../../utils/logger.js';
+import { logChromaWriteFailure } from '../../search/errors.js';
 
 /**
  * Auto-memory ingest route. Stores Claude Code memory files DIRECTLY as
@@ -79,7 +79,7 @@ export class MemoryIngestRoutes extends BaseRouteHandler {
           chromaSync
             .syncObservation(result.id, memorySessionId, obs.project, observation, 0, result.createdAtEpoch)
             .catch((err: unknown) => {
-              logger.error('CHROMA', 'memory-ingest Chroma sync failed', { id: result.id }, err as Error);
+              logChromaWriteFailure('CHROMA', 'memory-ingest Chroma sync failed', { id: result.id }, err);
             });
         }
 

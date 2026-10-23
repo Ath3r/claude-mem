@@ -4,6 +4,236 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [15.0.0] - 2026-10-20
+
+# Smart memory search by default
+
+Memory recall now defaults to Smart: search the compact index, inspect context around relevant results, then fetch only the selected details. The agent reasons about relevance between these three steps. Local, cloud/Pro, and standalone-server instructions describe the tools available in that runtime.
+
+The optional one-call lookup is now `dumb_search`. Its description is explicit: “Doesn’t reason about the results. Fast, but shallow. Use Smart for reliable recall.” It performs deterministic title matching and does not reason about relevance.
+
+## Migration
+
+- Use the `mem-search` skill for default Smart recall. Local tools are `search` → `timeline` → `get_observations`; Cloud/Pro starts with `memory_search` and can fetch selected summaries with `get_summaries`.
+- Replace calls to the old `mem_search` guided/auto API and `flash_search` with the Smart workflow, or explicitly choose `dumb_search` for a shallow lookup. Auto/guided modes and continuation cursors are removed.
+- Refresh existing MCP connections so clients load the new tool catalog and descriptions.
+
+## Correctness
+
+- Cloud timeline supports context anchored to a selected search result.
+- Standalone-server recall stays scoped to its configured server project rather than reading a local worker's memory.
+- Selected-detail output reports its bounds honestly and preserves selected record identities when long content must be shortened.
+- Native memory lookup uses observation-only indexes, and mixed local indexes retain session/prompt ID prefixes so follow-up reads cannot select a different record kind with the same number.
+- Installer prompts, public documentation, integration instructions, and generated memory guidance use the same Smart-first policy.
+
+## Other changes since v14.0.1
+
+- Added Hermes Agent memory support and installation, including safe handling of existing YAML configuration.
+- Added fallback between an Anthropic API key and the Claude subscription, with quota classification and recovery back to the primary provider at a message boundary.
+- Kept worker HTTP requests responsive during local context reads, bounded broad full-text fallback searches, and removed quadratic tag-stripping stalls.
+- Improved memory correctness: `type="all"` searches every category, deleted observations remove their Chroma documents, unexpected Chroma exits reject pending requests, and failed Windows checkpoint renames preserve the previous checkpoint.
+- Tightened privacy and request handling: fully private prompts no longer become stored user requests; key redaction handles trailing dashes; internal Grok research briefs do not become user work; multilingual work requests are recognized; and OpenRouter field condensation avoids unnecessary reasoning.
+- Improved installation and runtime reliability across Windows, macOS, Conda, Qoder, Goose, OpenCode, Antigravity, Codex, and TeamBrain. Fixes include launcher self-recursion and working-directory handling, stale temporary-directory cleanup, actionable authentication and missing-runtime errors, and correct host hook registration.
+- Added optional cross-project context with `CLAUDE_MEM_CONTEXT_PROJECTS=all`, corrected folder context ordering and glob matching, expired orphaned summary spool entries, and improved effective-data-directory log lookup and cloud authentication telemetry.
+
+Validation and delivery identities are recorded separately in the release receipt after the final builds, deployment, and package checks complete.
+
+## [14.0.1] - 2026-10-17
+
+Cards keep the agent who did the work when new updates arrive, instead of showing Unassigned work.
+
+## [14.0.0] - 2026-10-17
+
+## Claude-Mem 14.0.0: My Work and TeamBrain
+
+### My Work: see what you asked for, and where it stands
+Claude-Mem now opens on **My Work**, a local, human-readable view of the requests you've given your agents.
+
+- **Cards, List and Agents views.** Full-width request cards with the title, a plain-language summary, who worked on it and the project. Switch to a sortable list or a view by agent. "Attention first" sorting brings anything that needs you to the top.
+- **Readable summaries.** Each request gets a short everyday-language summary of what happened and the next step, written by the model you've already configured. The last good summary stays visible while a new one is written. With no compatible provider, you see the recorded wording.
+- **Live status.** In progress, Needs you, No recent update, Ready to check and Checked update as work is recorded, without the page jumping while you read.
+- **Review.** Mark a result as checked yourself, so an agent reporting "done" is never mistaken for a person confirming it.
+- **Drill down.** Open any request to see the work behind it: workstreams, recorded evidence and the original request.
+
+My Work is free, open source and runs on your machine.
+
+### TeamBrain: shared work for teams (optional)
+TeamBrain brings the work your team chooses to share into the same experience: open work, useful context and handoffs, without anyone's private work being broadcast. Teams can set it up self-serve at **$50 per seat per month** at https://cmem.ai/teambrain.
+
+### Also in this release
+- Codex: skips next-message suggestion and rollout-consolidation helper prompts (#4812).
+- Windows tests now spawn the running Bun directly (#4814).
+
+**Upgrade:** `npx claude-mem@latest install`
+
+## [13.41.0] - 2026-10-17
+
+# Build, release, and work-state visibility
+
+## Workflow skills
+
+- `build` delegates a coding session through `make-plan`, `do`, and `babysit`.
+- `release` delegates publication through `version-bump` and `childhood`.
+- `build-and-release` runs both, merging the ready PR before continuing from updated main.
+- Restores the existing `childhood` skill so post-release verification is included.
+
+The new wrappers are deliberately short. They reuse the existing workflows.
+
+## Work-state telemetry
+
+Adds privacy-preserving PostHog rollups for work-state usage by release, host platform, and recorded agent role. The rollups distinguish captured reads and writes, outcomes, native to-do use, instruction handoffs, and missing attribution.
+
+MCP execution receipts also cover failures before a worker responds. They are a separate observation source and must not be added to captured-call totals.
+
+Instruction handoffs are measured after the platform adapter formats the model-bound output and stdout succeeds. Cached context is included; discarded context and failed output are not counted as successful handoffs. Delayed or untimestamped captures cannot inherit a later instruction handoff.
+
+These are diagnostic signals, not a compliance score. Returning instructions does not prove that a host accepted them or an agent followed them, and an ordinary question may correctly require no write.
+
+No task titles, prompt text, project paths, or raw session/agent IDs are sent. Existing telemetry opt-out remains in effect. This release does not backfill earlier usage.
+
+Local replay deduplication lasts 30 days; older events are dropped. Public/private turn boundaries remain content-free and prevent private activity from inheriting an earlier public prompt. Hosts without verified original timestamps remain outside captured prompt/tool totals.
+
+## [13.40.0] - 2026-10-16
+
+## What's new
+
+### TeamBrain from the terminal
+- `npx claude-mem teambrain join <invite-link>` connects this install to a TeamBrain team using the same device-code sign-in as `install`. You approve the device in the browser, then choose which projects to share. Also: `teambrain status`, `teambrain share`, `teambrain leave`, `teambrain start`. (#4815)
+- Members who join with a team seat keep their own local observer — joining never switches your observer provider.
+- When an install belongs to a team, SessionStart adds a short **team brief**: open collisions in this project, recent plans and decisions, who else is active, and items delegated to you. Agents also get read-only `team_brief` and `team_search` MCP tools. Installs that are not in a team see no change.
+
+### Work-state sync
+- The agent's work-state tracker (`work_state_write` / `work_state_read`) now syncs to the cloud as a `work_state` content kind, for accounts where the sync server enables it. Until then rows wait locally — they are never dropped. Devices that skipped work-state ops on older builds apply them once after upgrading. (#4569)
+
+### Also new
+- The Claude observer can batch queued events (opt-in). (#4793)
+- Viewer: the NOTES summary section has its own icon (#4776); long prompts clamp behind a "Show more" disclosure (#4765).
+
+## Fixes
+- Codex: bundle Zod so cached hooks load without `node_modules` (#4771); reject a host root without its dependencies in the hook resolver (#4766); finish teardown before removing the private runtime (#4792).
+- Search: reject an unparseable `dateStart`/`dateEnd` with `400 INVALID_DATE` (#4786); validate `limit`/`offset` with `400 INVALID_PAGINATION` (#4787); make the implicit 90-day recency window configurable (#4773).
+- Privacy: strip nested and overlapping memory tags (#4761); opt-in generic credential patterns, with the redaction settings documented (#4762).
+- Ingest: register an unknown project when hook payloads have no cwd (#4774); apply `CLAUDE_MEM_SKIP_BASH_PATTERNS` to the PowerShell tool (#4756).
+- Hooks: skip SessionEnd for sessions that are never tracked (#4780); fix hook spool delivery to remote workers (#4626).
+- Worker: spare a silent worker whose liveness heartbeat is fresh, for a bounded time (#4794).
+- Projects: promote a merged-from project to a read key only for whole-project merges (#4789).
+- Context files: keep CLAUDE.md/AGENTS.md symlinks when refreshing context (#4784).
+- Exclusions: a trailing `/**` pattern also excludes the directory itself (#4785).
+- Cursor: preserve your own `hooks.json` entries on install/uninstall (#4783).
+- Logger: keep the day log open instead of re-opening it per line (#4791).
+- Launcher: ad-hoc re-sign the compiled binary on macOS before the protocol probe (#4781).
+- CLI: show help for `install`, `update`, `uninstall` and other action verbs instead of running them (#4767).
+- DSH: keep every table's header when collapsing duplicate rows (#4790).
+- Tree-sitter: verify the CLI loads, not just that it exists (#4777).
+- Build: leave posthog-node's optional OpenTelemetry import unresolved (#4795).
+
+## Upgrade notes
+- The local database schema moves to **v67** on first open. Older builds refuse a database a newer build has opened (no downgrade), so update every install that shares `~/.claude-mem`.
+- If work-state sync is enabled for your account, your existing work-state history uploads once.
+- Using claude-mem on more than one machine? Update all of them — builds older than v13.29.0 cannot skip sync content they don't recognize.
+
+## [13.39.0] - 2026-10-13
+
+## Codex: memory timeline returns to subagent threads after compaction
+
+When Codex compacts a thread, the memory timeline drops out of its history. The root thread already got it back through `SessionStart` (source `compact`). Codex never sends `SessionStart` to subagent threads, though, so a subagent that compacted kept working without its memory.
+
+- A new **PostCompact** hook marks the compacted thread, keyed by `session_id` plus `agent_id`.
+- That thread's next **PostToolUse** records the observation as usual, consumes the marker, and returns the timeline once as `additionalContext`.
+- **SessionStart** clears the marker, so the root thread never gets the timeline twice.
+- Shared session-marker file handling now backs both the Codex compaction gate and the Kimi context gate.
+
+PR: #4733
+
+## [13.38.0] - 2026-10-13
+
+No more console window flashing on Windows. Every Claude Code hook now calls claude-mem directly instead of going through bash, and this release also carries 16 community fixes from five contributors.
+
+## Hooks call claude-mem directly (#4345)
+
+Every Claude Code runtime hook now runs a small `claude-mem` launcher in exec form (`"command": "claude-mem", "args": [...]`), with no shell in between. On Windows that ends the console window that used to flash and steal focus on every tool call (#3605, #3559, #3521, #3396, #3248).
+
+- `npx claude-mem install` / `update` compile the launcher on your machine. It goes to `~/.local/bin/claude-mem` on macOS and Linux, or `%LOCALAPPDATA%\claude-mem\bin\claude-mem.exe` on Windows, and that folder is added to your PATH if it isn't there already. `npx claude-mem uninstall` removes the launcher.
+- Marketplace-only installs repair themselves. A startup step places or refreshes the launcher and tells you when Claude Code needs a restart.
+- The launcher fails open. On any problem it prints one line, `claude-mem: <reason>, continuing without memory`, and your session carries on.
+- The environment opt-outs (`CLAUDE_MEM_DISABLE_TOOL_HOOKS`, `CLAUDE_MEM_DISABLE_OBSERVATION`, `CLAUDE_MEM_DISABLE_FILE_CONTEXT`) still take effect before anything heavy starts.
+
+**Before you upgrade:**
+- Hooks in exec form need **Claude Code 2.1.139 or newer**. `install` and `doctor` warn on older versions.
+- If the launcher's folder wasn't on your PATH yet, the first session after updating will tell you to **restart Claude Code from a new terminal**. After that, everything works as before.
+
+Thanks @bagr001 for testing it on Windows 11.
+
+## Observer and worker
+
+- **Gateways that reject the `thinking` parameter no longer stall the observer** (#4735, @akushonkamen). The observer retries once without the parameter. The token-saving default is unchanged, and `CLAUDE_MEM_OBSERVER_THINKING` is now documented.
+- **The worker no longer wedges for hours on big repos** (#4753, @akushonkamen). Git commands during worktree adoption now run without blocking the event loop.
+- **The streamed-request idle window is configurable** (#4752, @akushonkamen) with `CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS`, for self-hosted backends with long queue waits. The default is still 90 seconds.
+- **`CLAUDE_MEM_DISABLE_SUMMARY=1`** skips the end-of-session summary for headless or read-only runs (#4736, @akushonkamen).
+- **Mode prompts are validated**, and a user mode file can no longer shadow a bundled mode (#4326).
+- **Three platform fixes** (#3851):
+  - manual sessions keep their platform;
+  - an error-shaped response is no longer taken for a host observer;
+  - Grok agents added after install are watched.
+- **The Codex installer drops a dead local marketplace registration**, and install fails when Codex doesn't list the plugin afterwards (#3494).
+
+## Search, viewer and data, thank you @rudycelekli
+
+- Semantic search no longer breaks on empty filters (#4754) or on malformed stored concept or file data (#4750). It now matches keyword search.
+- The Sessions list matches project names regardless of case (#4749).
+- Feed rows with the same timestamp come back in a stable newest-first order (#4747).
+- Repeated prompts with their own native turn ids are no longer merged into one (#4748).
+- Restoring an export keeps each prompt's native turn id (#4751).
+- Deleting a project's last memories brings the welcome hint back right away (#4742).
+- A corpus built without a limit gets the documented 500 observations, and limits above 100 are no longer capped at 100 (#4746).
+
+## Sync and server
+
+- **Chroma writes for the same memory are serialized and re-read the current row** (#4731, @junnhwan). A startup backfill or a delayed cloud forward can no longer index an old body or old project.
+- **On the self-hosted server, a reclaimed generation attempt can't complete or fail its replacement** (#4739, @junnhwan). Postgres regression tests now run in CI.
+- **The self-hosted sync server puts brackets around IPv6 hosts** in its advertised URL (#4723, @DeryFerd).
+
+## Viewer
+
+- The NOTES section icon is sized like its siblings (#4744, @phant0um, first contribution). It used to render about 20× too large.
+
+## Claude app (cowork) plugin
+
+- Session-init now runs in the background, and the plugin's hooks stand down when a local claude-mem install is present (#4755).
+
+## Docs and skills
+
+- The make-plan skill has a Primary Goal section and a fixed short chat summary (#3600).
+- The wowerpoint skill stops once the deck has started and no longer uploads (#4342).
+- Docs no longer mention workers.dev for the sync hub (#4366).
+
+Thanks to everyone who reported and fixed things this round: @rudycelekli, @junnhwan, @akushonkamen, @DeryFerd, @phant0um, @valerianbbragi, @smashingtags, @wuding129, @chris-yyau, @bagr001.
+
+**Full diff:** https://github.com/thedotmack/claude-mem/compare/v13.37.0...v13.38.0
+
+## [13.37.0] - 2026-10-13
+
+This release fixes the broken 13.36.1 marketplace update. After that update, the worker, the MCP search server and the server runtime failed to start, so memory capture stopped. Upgrading is strongly recommended.
+
+## Fixes
+
+- **claude-mem starts again after the 13.36.1 marketplace update** (#4728, #4729). A change merged after the 13.36.1 release committed the built plugin files with leftover `git stash` conflict markers. The plugin installs from `main`, so auto-updated installs got those files under the same 13.36.1 version number. The worker failed with `error: Unexpected <<`, `mcp-search` closed its connection, and memory capture stopped once the older worker exited. The files are now rebuilt from clean source. The npm package `claude-mem@13.36.1` was published before that change and was not affected. Thank you @nashsibanda for the rebuild and @hirohisatanigawa for the detailed report.
+- **Worker startup waits out a locked database instead of failing** (#4725). The schema-writer check added in 13.36.0 ran before the connection's busy timeout was set. A worker starting while another process was opening the same database failed in about 1 ms with `database is locked`, and after two failures it was not restarted. The check now waits for the lock.
+
+## Changed
+
+- **Memory keeps capturing on your Anthropic plan when your selected provider can't serve** (#4727). `CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER` now defaults to `claude`. Settings files that saved `""` get the new default too. The fallback now also covers a provider that is still rate limited or over capacity after its retries, is down, or returns the same batch twice with no usable output. Claude is used only when a Claude Code login or an Anthropic key is available. Memory moves back to your provider once it answers again. To wait for your provider instead, set `CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER` to `off`.
+
+## Release safety
+
+- CI now checks the committed plugin files before it rebuilds them. It fails on merge-conflict markers anywhere in `plugin/` and runs `node --check` on every committed plugin script (#4729). Before this, CI rebuilt the bundles first and tested the rebuilt copies, which hid the broken committed ones.
+
+## If you used the 13.35.0 workaround
+
+If you followed the workaround in #4728 (auto-update turned off and the plugin pinned to 13.35.0), turn `autoUpdate` back on for the `thedotmack` marketplace and restart Claude Code to move to 13.37.0.
+
+**Full diff:** https://github.com/thedotmack/claude-mem/compare/v13.36.1...v13.37.0
+
 ## [13.36.1] - 2026-10-12
 
 A patch release that closes three issues found in review of 13.36.0, plus eight community fixes. Upgrading is recommended.

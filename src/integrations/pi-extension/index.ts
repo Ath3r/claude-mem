@@ -185,6 +185,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
         if (selectEntry()?.id !== entry.id) return;
         const response = await worker.post('/api/sessions/init', {
           contentSessionId: session.id, cwd: session.cwd, prompt, platformSource: 'pi', nativePromptId: entry.id,
+          telemetryPromptEpochMs: entry.message!.timestamp,
         });
         const result = await response.json() as {
           skipped?: boolean; reason?: string; sessionDbId?: number;
@@ -219,6 +220,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
   });
 
   pi.on('tool_result', (event, ctx) => {
+    const telemetryToolEpochMs = Date.now();
     const session = current;
     if (!session || !event.toolName || event.toolName.startsWith('mem_')) return;
     const text = extractTextContent(event.content);
@@ -228,6 +230,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
         contentSessionId: session.id, cwd: session.cwd, platformSource: 'pi',
         tool_name: event.toolName, tool_input: event.input,
         tool_response: text.slice(0, 100_000), tool_use_id: event.toolCallId,
+        telemetryToolEpochMs,
       });
     });
   });
@@ -273,7 +276,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
     });
   };
   const limit = Type.Optional(Type.Integer({ minimum: 1, maximum: 50 }));
-  tool('mem_search', 'Memory search', 'Search memory for an index of IDs; use timeline, then fetch only useful observations.',
+  tool('mem_search', 'Smart search (default)', 'Step 1 of Smart search: search memory for an index of IDs; reason about mem_timeline context, then fetch only selected IDs with mem_get_observations.',
     Type.Object({ query: Type.String(), limit }), (params, signal) => {
       const query = new URLSearchParams({ query: String(params.query), limit: String(params.limit ?? 10) });
       return worker.request('/api/search?' + query, { signal });

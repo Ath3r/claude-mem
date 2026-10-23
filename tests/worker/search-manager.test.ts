@@ -441,7 +441,7 @@ describe('SearchManager platform-scoped Chroma hydration', () => {
       ],
     });
     expect(getSessionSummariesByIds).toHaveBeenCalledWith([session.id], {
-      orderBy: 'date_desc',
+      orderBy: 'relevance',
       limit: 10,
       project: 'search-project',
       projects: ['search-project'],
@@ -500,7 +500,7 @@ describe('SearchManager platform-scoped Chroma hydration', () => {
     });
 
     expect(getUserPromptsByIds).toHaveBeenCalledWith([prompt.id], {
-      orderBy: 'date_desc',
+      orderBy: 'relevance',
       limit: 10,
       project: 'search-project',
       projects: ['search-project'],
@@ -509,7 +509,7 @@ describe('SearchManager platform-scoped Chroma hydration', () => {
     expect(result.prompts).toEqual([prompt]);
   });
 
-  it('passes platformSource into getTimelineByQuery auto-mode hydration', async () => {
+  it('passes platformSource and project scope through query-selected timeline hydration', async () => {
     const observation = {
       id: 8,
       memory_session_id: 'cursor-memory-id',
@@ -554,13 +554,13 @@ describe('SearchManager platform-scoped Chroma hydration', () => {
 
     await manager.getTimelineByQuery({
       query: 'timeline',
-      mode: 'auto',
       project: 'search-project',
       platform_source: 'cursor',
     });
 
     expect(searchObservations).toHaveBeenCalledWith('timeline', {
       project: 'search-project',
+      projects: ['search-project'],
       platformSource: 'cursor',
       limit: 1,
     });
@@ -571,6 +571,7 @@ describe('SearchManager platform-scoped Chroma hydration', () => {
       10,
       'search-project',
       'cursor',
+      ['search-project'],
     );
   });
 
@@ -1259,5 +1260,100 @@ describe('SearchManager dates survive a host whose date formatter cannot initial
     const text = rendered.content[0].text as string;
 
     expect(text).toContain('   - Date: 2025-01-04 9:34 PM UTC');
+  });
+});
+
+describe('SearchManager recency window wiring (#4770)', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  // One fresh hit (10 days old) and one ancient hit (365 days old) served by
+  // the same mocked Chroma response, so every window wiring below is judged
+  // by whether the ancient match survives the manager's own filtering.
+  function makeManager(recencyWindowMs?: number) {
+    const newEpoch = Date.now() - 10 * DAY_MS;
+    const oldEpoch = Date.now() - 365 * DAY_MS;
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [101, 102],
+      distances: [0.2, 0.3],
+      metadatas: [
+        { sqlite_id: 101, doc_type: 'observation', created_at_epoch: newEpoch },
+        { sqlite_id: 102, doc_type: 'observation', created_at_epoch: oldEpoch },
+      ],
+    }));
+    const getObservationsByIds = mock((ids: number[]) =>
+      ids.map(id => ({ id, created_at_epoch: id === 101 ? newEpoch : oldEpoch }))
+    );
+    const sessionStore = {
+      getObservationsByIds,
+      getSessionSummariesByIds: mock(() => []),
+      getUserPromptsByIds: mock(() => []),
+      getProjectReadKeys: (projects: string[]) => projects,
+    };
+    const sessionSearch = {
+      searchObservations: mock(() => []),
+      searchSessions: mock(() => []),
+      searchUserPrompts: mock(() => []),
+    };
+    const manager = recencyWindowMs === undefined
+      ? new SearchManager(sessionSearch as any, sessionStore as any, { queryChroma } as any, {} as any, {} as any)
+      : new SearchManager(sessionSearch as any, sessionStore as any, { queryChroma } as any, {} as any, {} as any, recencyWindowMs);
+    return { manager, queryChroma, getObservationsByIds };
+  }
+
+  const obsScope = {
+    obs_type: undefined,
+    concepts: undefined,
+    files: undefined,
+    searchObservations: true,
+    searchSessions: false,
+    searchPrompts: false,
+  };
+
+  const keptIds = (rows: Array<{ id: number }>) => rows.map(row => row.id);
+
+  it('keeps the shipped 90-day window when the constructor gets no window (performChromaSemanticSearch)', async () => {
+    const { manager } = makeManager();
+    const results = await (manager as any).performChromaSemanticSearch('memory', undefined, { limit: 10 }, obsScope);
+    expect(keptIds(results.observations)).toEqual([101]);
+  });
+
+  it('keeps every match when the window is disabled with 0 (performChromaSemanticSearch)', async () => {
+    const { manager } = makeManager(0);
+    const results = await (manager as any).performChromaSemanticSearch('memory', undefined, { limit: 10 }, obsScope);
+    expect(keptIds(results.observations)).toEqual([101, 102]);
+  });
+
+  it('honors a custom window of 30 days (performChromaSemanticSearch)', async () => {
+    const { manager } = makeManager(30 * DAY_MS);
+    const results = await (manager as any).performChromaSemanticSearch('memory', undefined, { limit: 10 }, obsScope);
+    expect(keptIds(results.observations)).toEqual([101]);
+  });
+
+  it('keeps every match when the window is disabled with 0 (hybridSemanticHydrate)', async () => {
+    const { manager } = makeManager(0);
+    const rows = await (manager as any).hybridSemanticHydrate(
+      'memory', 'observation', undefined, undefined,
+      (ids: number[]) => ids.map(id => ({ id }))
+    );
+    expect(keptIds(rows)).toEqual([101, 102]);
+  });
+
+  it('honors a custom window of 30 days (hybridSemanticHydrate)', async () => {
+    const { manager } = makeManager(30 * DAY_MS);
+    const rows = await (manager as any).hybridSemanticHydrate(
+      'memory', 'observation', undefined, undefined,
+      (ids: number[]) => ids.map(id => ({ id }))
+    );
+    expect(keptIds(rows)).toEqual([101]);
+  });
+
+  it('forwards the constructor window to the orchestrator Chroma strategy', async () => {
+    const disabled = makeManager(0);
+    const disabledResult = await disabled.manager.getOrchestrator().search({ query: 'memory', type: 'observations' });
+    expect(keptIds(disabledResult.results.observations)).toEqual([101, 102]);
+
+    const custom = makeManager(30 * DAY_MS);
+    const customResult = await custom.manager.getOrchestrator().search({ query: 'memory', type: 'observations' });
+    expect(keptIds(customResult.results.observations)).toEqual([101]);
   });
 });
